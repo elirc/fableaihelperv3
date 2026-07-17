@@ -1,0 +1,46 @@
+{
+  "name": "ai-call-assistant",
+  "productName": "AI Call Assistant",
+  "version": "2.0.0",
+  "description": "Streams call audio to a live transcript and generates AI-suggested answers with sub-second latency.",
+  "main": "out/main/main.js",
+  "author": "Owner",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.main.json && vite build",
+    "start": "npm run build && electron .",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
+    "dist": "npm run build && electron-builder --win"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.111.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "electron": "^43.1.0",
+    "electron-builder": "^26.15.3",
+    "typescript": "^5.7.0",
+    "vite": "^8.1.4",
+    "vitest": "^4.1.10"
+  },
+  "build": {
+    "appId": "com.aihelper.callassistant",
+    "productName": "AI Call Assistant",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}

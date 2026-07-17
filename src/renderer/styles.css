@@ -1,0 +1,302 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #16181d;
+  --panel: #1f2229;
+  --border: #2c3038;
+  --text: #e8eaed;
+  --muted: #8b919c;
+  --accent: #e5484d;
+  /* Lighter red for text/icons on dark fills — --accent itself is only ~3:1 there. */
+  --accent-bright: #ff8a8e;
+  --accent-soft: #3b2326;
+  --blue: #4c8dff;
+  --green: #3fb950;
+  --amber: #d29922;
+}
+
+/* `[hidden] { display: none }` is a user-agent rule, and author rules beat the
+   UA sheet whatever their specificity — so the `display: flex` on `main` and
+   `#settingsView` below would otherwise cancel their `hidden` attribute and
+   render both views stacked on top of each other. */
+[hidden] { display: none !important; }
+
+html, body { height: 100%; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+  -webkit-app-region: drag;
+}
+header button { -webkit-app-region: no-drag; }
+
+.brand { display: flex; align-items: center; gap: 8px; min-width: 0; }
+h1 { font-size: 15px; font-weight: 600; white-space: nowrap; }
+
+.dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--green);
+  flex: none;
+}
+.dot.recording { background: var(--accent); animation: pulse 1.2s infinite; }
+.dot.busy { background: var(--amber); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dot.recording { animation: none; }
+  .meter-fill { transition: none; }
+}
+
+.icon-btn {
+  background: none; border: none; color: var(--muted);
+  font-size: 17px; cursor: pointer; padding: 4px 6px; border-radius: 6px;
+  flex: none;
+}
+.icon-btn:hover { color: var(--text); background: var(--panel); }
+
+main, #settingsView {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.status { color: var(--muted); font-size: 12.5px; text-align: center; min-height: 16px; flex: none; }
+
+.record-btn {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  width: 100%; padding: 14px;
+  font-size: 16px; font-weight: 600;
+  color: #fff; background: var(--accent);
+  border: none; border-radius: 10px; cursor: pointer;
+  flex: none;
+}
+.record-btn:hover { filter: brightness(1.1); }
+.record-btn:disabled { opacity: 0.55; cursor: default; }
+.record-btn.recording { background: var(--accent-soft); color: var(--accent-bright); outline: 1px solid var(--accent); }
+
+.rec-icon {
+  width: 12px; height: 12px; border-radius: 50%; background: #fff; flex: none;
+}
+.record-btn.recording .rec-icon { background: var(--accent-bright); border-radius: 2px; }
+
+/* Hotkey chip inside the record button. */
+.kbd {
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.3px;
+  color: #ffffffcc;
+  background: #00000038;
+  border: 1px solid #ffffff40;
+  border-radius: 4px;
+  padding: 1px 5px;
+  white-space: nowrap;
+}
+.record-btn.recording .kbd { color: var(--accent-bright); border-color: #ffffff2e; background: #0000002e; }
+
+.notice {
+  background: #2b2415; border: 1px solid #5c4a1c; color: #e9c46a;
+  padding: 7px 10px; border-radius: 8px; font-size: 12px; line-height: 1.4;
+  flex: none;
+}
+
+.meter-row { display: flex; align-items: center; gap: 10px; min-height: 16px; flex: none; }
+.meter {
+  flex: 1; height: 6px; border-radius: 3px;
+  background: var(--panel); border: 1px solid var(--border);
+  overflow: hidden;
+}
+.meter-fill {
+  height: 100%; width: 0%;
+  background: var(--green);
+  transition: width 90ms linear;
+}
+.timer { color: var(--accent-bright); font-variant-numeric: tabular-nums; font-size: 12.5px; min-width: 42px; text-align: right; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  display: flex; flex-direction: column;
+  min-height: 74px;
+  flex: none;
+}
+.panel.grow { flex: 1; min-height: 130px; }
+
+.panel-title {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px;
+  color: var(--muted); padding: 8px 12px 0;
+  flex: none;
+}
+.panel-body {
+  padding: 6px 12px 10px;
+  white-space: pre-wrap;
+  line-height: 1.5;
+  overflow-y: auto;
+  overflow-wrap: break-word;
+  flex: 1;
+}
+.placeholder { color: var(--muted); font-style: italic; }
+
+.live-tag, .gen-tag {
+  color: var(--green); font-size: 10px; letter-spacing: 0.4px;
+  border: 1px solid var(--green); border-radius: 4px; padding: 0 5px;
+  text-transform: none;
+  flex: none;
+}
+.gen-tag { color: var(--amber); border-color: var(--amber); }
+
+/* Latency readout: present, never loud. */
+.latency {
+  color: var(--muted); font-size: 10px; letter-spacing: 0.2px;
+  text-transform: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mini-btn {
+  margin-left: auto;
+  background: none; border: 1px solid var(--border); color: var(--muted);
+  font-size: 11px; padding: 1px 8px; border-radius: 5px; cursor: pointer;
+  text-transform: none; letter-spacing: 0;
+  flex: none;
+}
+.mini-btn:hover { color: var(--text); border-color: var(--muted); }
+
+/* History nav */
+.history { display: flex; align-items: center; gap: 2px; margin-left: auto; flex: none; }
+.nav-btn {
+  background: none; border: 1px solid transparent; color: var(--muted);
+  font-size: 14px; line-height: 1; cursor: pointer;
+  padding: 1px 6px; border-radius: 5px;
+}
+.nav-btn:hover:not(:disabled) { color: var(--text); border-color: var(--border); }
+.nav-btn:disabled { opacity: 0.35; cursor: default; }
+.history-label {
+  color: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums;
+  text-transform: none; letter-spacing: 0; min-width: 26px; text-align: center;
+}
+
+.error {
+  background: #3b2326; border: 1px solid #6e2a2f; color: #ff9096;
+  padding: 9px 12px; border-radius: 8px; font-size: 13px;
+  flex: none;
+}
+
+/* ---------- Rendered markdown answer ---------- */
+/* Block layout comes from real elements, so the pre-wrap used for the raw
+   transcript would only add stray gaps here. */
+.md { white-space: normal; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 8px; }
+.md h3, .md h4, .md h5, .md h6 {
+  font-size: 13px; font-weight: 600; margin: 10px 0 4px; color: var(--text);
+}
+.md ul, .md ol { margin: 0 0 8px; padding-left: 20px; }
+.md li { margin: 2px 0; }
+.md li::marker { color: var(--muted); }
+.md strong { font-weight: 600; color: #fff; }
+.md em { font-style: italic; }
+.md code {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  background: #00000047;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.md pre {
+  background: #00000047;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 0 0 8px;
+  overflow-x: auto;
+}
+.md pre code {
+  background: none; border: none; padding: 0;
+  white-space: pre;
+}
+.md hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+
+/* Settings */
+#settingsView h2 { font-size: 16px; margin-bottom: 2px; }
+#settingsView h2:focus-visible { outline: 2px solid var(--blue); outline-offset: 4px; }
+#settingsView label { font-size: 13px; font-weight: 600; margin-top: 4px; }
+.hint { color: var(--muted); font-weight: 400; font-size: 12px; line-height: 1.45; }
+.hint a { color: var(--blue); }
+.hint code {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  background: #00000047;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+input[type="password"], input[type="text"], textarea, select {
+  width: 100%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 10px;
+  font-family: inherit;
+  font-size: 13px;
+  resize: vertical;
+}
+input:focus-visible, textarea:focus-visible, select:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 0;
+  border-color: var(--blue);
+}
+
+.check { display: flex; align-items: center; gap: 8px; font-weight: 400 !important; }
+.check input { width: auto; }
+
+.row { display: flex; gap: 8px; margin-top: 4px; }
+.row button {
+  flex: 1; padding: 10px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--panel); color: var(--text); font-weight: 600; cursor: pointer;
+}
+.row button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+.row button:hover { filter: brightness(1.1); }
+
+.saved { color: var(--green); text-align: center; font-size: 13px; }

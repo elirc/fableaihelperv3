@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'" />
+  <title>AI Call Assistant</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="dot" id="statusDot" aria-hidden="true"></span>
+      <h1>AI Call Assistant</h1>
+    </div>
+    <button id="settingsBtn" class="icon-btn" type="button" aria-label="Settings" title="Settings">
+      <span aria-hidden="true">&#9881;</span>
+    </button>
+  </header>
+
+  <main id="mainView">
+    <div class="status" id="statusText" role="status">Ready — press Record while the other person is speaking</div>
+
+    <button id="recordBtn" class="record-btn" type="button">
+      <span class="rec-icon" aria-hidden="true"></span>
+      <span id="recordLabel">Record</span>
+      <span class="kbd" id="hotkeyHint" aria-hidden="true" hidden></span>
+    </button>
+
+    <div class="notice" id="hotkeyWarn" role="status" hidden></div>
+
+    <div class="meter-row">
+      <div class="meter"><div class="meter-fill" id="meterFill"></div></div>
+      <div class="timer" id="timer" aria-hidden="true"></div>
+    </div>
+
+    <section class="panel" aria-labelledby="transcriptTitle">
+      <div class="panel-title">
+        <span id="transcriptTitle">Question heard</span>
+        <span class="live-tag" id="liveTag" hidden>live</span>
+        <div class="history" id="historyBar" role="group" aria-label="Answer history" hidden>
+          <button id="prevBtn" class="nav-btn" type="button" aria-label="Previous question">&#8249;</button>
+          <span class="history-label" id="historyLabel"></span>
+          <button id="nextBtn" class="nav-btn" type="button" aria-label="Next question">&#8250;</button>
+        </div>
+      </div>
+      <div class="panel-body" id="transcriptBox"><span class="placeholder">The live transcript will appear here while you record.</span></div>
+    </section>
+
+    <section class="panel grow" aria-labelledby="answerTitle">
+      <div class="panel-title">
+        <span id="answerTitle">Suggested answer</span>
+        <span class="gen-tag" id="genTag" hidden>generating…</span>
+        <span class="latency" id="latencyTag" hidden></span>
+        <button id="copyBtn" class="mini-btn" type="button" aria-label="Copy answer" hidden><span id="copyLabel">Copy</span></button>
+      </div>
+      <div class="panel-body md" id="answerBox" aria-live="polite" aria-atomic="false" tabindex="0"><span class="placeholder">Your AI-suggested answer will stream here.</span></div>
+    </section>
+
+    <div class="error" id="errorBox" role="alert" hidden></div>
+  </main>
+
+  <section id="settingsView" aria-labelledby="settingsHeading" hidden>
+    <h2 id="settingsHeading" tabindex="-1">Settings</h2>
+
+    <div class="error" id="settingsError" role="alert" hidden></div>
+
+    <label for="deepgramKey">Deepgram API key <span class="hint">(live transcription) — <a href="https://console.deepgram.com/" target="_blank" rel="noreferrer">get one</a></span></label>
+    <input type="password" id="deepgramKey" autocomplete="off" />
+
+    <label for="llmProvider">Answer model</label>
+    <select id="llmProvider">
+      <option value="anthropic">Claude Haiku 4.5 (recommended)</option>
+      <option value="groq">Groq GPT-OSS 120B (fastest)</option>
+    </select>
+
+    <label for="anthropicKey">Anthropic API key <span class="hint"><a href="https://platform.claude.com/" target="_blank" rel="noreferrer">get one</a></span></label>
+    <input type="password" id="anthropicKey" autocomplete="off" />
+
+    <label for="groqKey">Groq API key <span class="hint">(only for the Groq preset) — <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer">get one</a></span></label>
+    <input type="password" id="groqKey" autocomplete="off" />
+
+    <label for="answerStyle">Answer style</label>
+    <select id="answerStyle">
+      <option value="brief">Brief — a few sentences, fastest to read</option>
+      <option value="balanced">Balanced — a short structured answer</option>
+      <option value="detailed">Detailed — fuller answer with specifics</option>
+    </select>
+
+    <label for="hotkey">Global shortcut <span class="hint">(toggles record from any app)</span></label>
+    <input type="text" id="hotkey" autocomplete="off" spellcheck="false" />
+    <p class="hint" id="hotkeyHelp">
+      Combine Ctrl, Alt, Shift or Super with a key, e.g.
+      <code>CommandOrControl+Shift+Space</code>. Leave empty to turn the shortcut off.
+    </p>
+
+    <label for="resume">Your resume <span class="hint">(paste as plain text)</span></label>
+    <textarea id="resume" rows="7" placeholder="Paste your resume here so answers match your background..."></textarea>
+
+    <label for="jobDescription">Job description <span class="hint">(the role you're interviewing for)</span></label>
+    <textarea id="jobDescription" rows="6" placeholder="Paste the job description here..."></textarea>
+
+    <label class="check" for="alwaysOnTop">
+      <input type="checkbox" id="alwaysOnTop" />
+      Keep window on top of the call app
+    </label>
+
+    <p class="hint">API keys are stored encrypted on this machine and never shown again here. This window is always hidden from screen sharing and recordings.</p>
+
+    <div class="row">
+      <button id="saveBtn" class="primary" type="button">Save</button>
+      <button id="backBtn" type="button">Back</button>
+    </div>
+    <div class="saved" id="savedNote" role="status" hidden>Saved ✓</div>
+  </section>
+
+  <div class="sr-only" id="srAnnounce" role="status"></div>
+
+  <script type="module" src="./app.ts"></script>
+</body>
+</html>
