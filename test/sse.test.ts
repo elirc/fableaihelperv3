@@ -75,6 +75,48 @@ describe('parseSSEChunk', () => {
     const { deltas } = parseSSEChunk(dataLine('done') + usage);
     expect(deltas).toEqual(['done']);
   });
+
+  test('skips empty-string deltas instead of emitting useless events', () => {
+    // An empty delta would still trigger an IPC round-trip and a DOM diff in
+    // the renderer for literally nothing.
+    const { deltas } = parseSSEChunk(dataLine('') + dataLine('real'));
+    expect(deltas).toEqual(['real']);
+  });
+
+  test('skips a null content delta', () => {
+    const nullContent = 'data: ' + JSON.stringify({ choices: [{ delta: { content: null } }] }) + '\n';
+    const { deltas } = parseSSEChunk(nullContent + dataLine('ok'));
+    expect(deltas).toEqual(['ok']);
+  });
+
+  test('ignores event: lines (only data: lines carry content)', () => {
+    const { deltas } = parseSSEChunk('event: message\n' + dataLine('x'));
+    expect(deltas).toEqual(['x']);
+  });
+
+  test('handles a data line split mid-JSON across two chunks', () => {
+    const line = dataLine('split across reads');
+    const cut = line.indexOf('across'); // land squarely inside the JSON payload
+    const first = parseSSEChunk(line.slice(0, cut));
+    expect(first.deltas).toEqual([]); // incomplete line: nothing emitted, nothing lost
+    expect(first.rest).toBe(line.slice(0, cut));
+
+    const second = parseSSEChunk(first.rest + line.slice(cut));
+    expect(second.deltas).toEqual(['split across reads']);
+    expect(second.rest).toBe('');
+  });
+
+  test('ignores the [DONE] sentinel with CRLF line endings too', () => {
+    const { deltas } = parseSSEChunk(dataLine('hi') + 'data: [DONE]\r\n');
+    expect(deltas).toEqual(['hi']);
+  });
+
+  test('a single chunk containing data lines, a comment, and [DONE] emits exactly the content', () => {
+    const chunk = ': keep-alive\n' + dataLine('a') + '\n' + dataLine('b') + 'data: [DONE]\n\n';
+    const { deltas, rest } = parseSSEChunk(chunk);
+    expect(deltas).toEqual(['a', 'b']);
+    expect(rest).toBe('');
+  });
 });
 
 describe('parseSSETail', () => {
@@ -109,6 +151,14 @@ describe('parseSSETail', () => {
 
   test('is idempotent for a tail that is already newline-terminated', () => {
     expect(parseSSETail(dataLine('x'))).toEqual(['x']);
+  });
+
+  test('ignores a tail that is only the [DONE] sentinel without a newline', () => {
+    expect(parseSSETail('data: [DONE]')).toEqual([]);
+  });
+
+  test('ignores a comment-only tail', () => {
+    expect(parseSSETail(': keep-alive')).toEqual([]);
   });
 });
 

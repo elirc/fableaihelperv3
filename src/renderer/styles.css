@@ -199,6 +199,11 @@ main, #settingsView {
 }
 .mini-btn:hover { color: var(--text); border-color: var(--muted); }
 
+/* Right-aligned button cluster in a panel title; the wrapper carries the auto
+   margin so two mini-btns don't split it between themselves. */
+.title-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: none; }
+.title-actions .mini-btn { margin-left: 0; }
+
 /* History nav */
 .history { display: flex; align-items: center; gap: 2px; margin-left: auto; flex: none; }
 .nav-btn {
@@ -208,6 +213,7 @@ main, #settingsView {
 }
 .nav-btn:hover:not(:disabled) { color: var(--text); border-color: var(--border); }
 .nav-btn:disabled { opacity: 0.35; cursor: default; }
+.clear-btn { font-size: 10.5px; text-transform: none; letter-spacing: 0; margin-right: 2px; }
 .history-label {
   color: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums;
   text-transform: none; letter-spacing: 0; min-width: 26px; text-align: center;
@@ -217,6 +223,33 @@ main, #settingsView {
   background: #3b2326; border: 1px solid #6e2a2f; color: #ff9096;
   padding: 9px 12px; border-radius: 8px; font-size: 13px;
   flex: none;
+}
+
+/* ---------- Ask box (typed-question fallback) ---------- */
+.ask-row { display: flex; align-items: center; gap: 8px; flex: none; }
+.ask-row input { flex: 1; padding: 7px 10px; }
+.ask-btn {
+  flex: none;
+  padding: 7px 14px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.ask-btn:hover:not(:disabled) { border-color: var(--muted); }
+.ask-btn:disabled, .ask-row input:disabled { opacity: 0.55; cursor: default; }
+
+/* ---------- Answer-style quick toggle ---------- */
+.style-row { display: flex; align-items: center; gap: 6px; flex: none; }
+.style-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; margin-right: 2px; }
+.chip {
+  flex: 1;
+  background: none; border: 1px solid var(--border); border-radius: 999px;
+  color: var(--muted); font-size: 12px; padding: 4px 10px; cursor: pointer;
+}
+.chip:hover:not([aria-pressed="true"]) { color: var(--text); border-color: var(--muted); }
+/* Selected fill picked for AA: white on this blue is >10:1, and the border
+   uses --blue (~5:1 on the page background) so the state reads without color. */
+.chip[aria-pressed="true"] {
+  background: #24406e; border-color: var(--blue); color: #fff; font-weight: 600;
 }
 
 /* ---------- Rendered markdown answer ---------- */

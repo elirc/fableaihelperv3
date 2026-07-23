@@ -100,6 +100,13 @@ export interface RendererApi {
   getSettings(): Promise<SettingsView>;
   saveSettings(patch: SettingsPatch): Promise<SettingsView>;
   startSession(): Promise<Result<number>>;
+  /**
+   * Ask a question directly (typed, or a re-ask of an earlier transcript)
+   * without recording. Returns a session id; the answer then arrives through
+   * the same event stream as a recorded session: one final stt:partial
+   * carrying the question text, llm:delta per token, llm:done / session:error.
+   */
+  askQuestion(text: string): Promise<Result<number>>;
   sendAudio(sessionId: number, pcm: ArrayBuffer): void;
   stopSession(sessionId: number): Promise<Result<null>>;
   cancelSession(sessionId: number): Promise<void>;

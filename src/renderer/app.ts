@@ -2,13 +2,13 @@ import { DEFAULT_HOTKEY } from '../shared/types';
 import type {
   AnswerMetrics,
   AnswerStyle,
-  AppError,
   LlmProviderId,
   RendererApi,
   Result,
   SettingsPatch,
   SettingsView,
 } from '../shared/types';
+import { errorMessage, formatAccelerator, formatTimer, latencyLabel, latencyTitle } from './format';
 import { createMarkdownView } from './markdown';
 
 declare global {
@@ -42,6 +42,11 @@ const historyBar = $('historyBar');
 const historyLabel = $('historyLabel');
 const prevBtn = $<HTMLButtonElement>('prevBtn');
 const nextBtn = $<HTMLButtonElement>('nextBtn');
+const clearBtn = $<HTMLButtonElement>('clearBtn');
+const regenBtn = $<HTMLButtonElement>('regenBtn');
+const askForm = $<HTMLFormElement>('askForm');
+const askInput = $<HTMLInputElement>('askInput');
+const askBtn = $<HTMLButtonElement>('askBtn');
 const srAnnounce = $('srAnnounce');
 const mainView = $('mainView');
 const settingsView = $('settingsView');
@@ -258,7 +263,7 @@ async function startRecording(): Promise<void> {
   recordStart = Date.now();
   timerInterval = setInterval(() => {
     const s = Math.floor((Date.now() - recordStart) / 1000);
-    timerEl.textContent = `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+    timerEl.textContent = formatTimer(s);
     // stopRecording() clears this interval via endCapture(), so the cap fires
     // once; the state check keeps it that way if it ever outlives the state.
     if (s >= MAX_SECONDS && state === 'recording') {
@@ -317,9 +322,73 @@ function toggleRecording(): void {
   }
 }
 
+// ---------- Ask (typed question / regenerate) ----------
+/**
+ * Push a typed (or re-asked) question through the normal answer pipeline. The
+ * reply arrives through the same session events as a recorded clip — one final
+ * stt:partial, then llm:delta / llm:done / session:error — so the existing
+ * handlers do all the rendering work.
+ */
+async function submitAsk(text: string): Promise<void> {
+  // Claim the UI the way onSessionError does: an in-flight recording start
+  // whose token is now stale must tear itself down instead of adopting the UI
+  // mid-ask. Asking over a still-streaming answer is fine — main aborts the
+  // old session when the new one starts, and nulling sessionId here drops any
+  // stragglers it emits before that lands.
+  const myRun = ++runId;
+  sessionId = null;
+  clearError();
+  beginLiveEntry();
+  const live = liveEntry();
+  if (live) live.question = text; // the transcript box shows the question immediately
+  setState('answering');
+
+  let result: Result<number>;
+  try {
+    result = await api.askQuestion(text);
+  } catch (err) {
+    if (myRun !== runId) return; // a newer run owns the UI now
+    dropLiveEntry();
+    setState('idle');
+    showError(err);
+    return;
+  }
+  if (myRun !== runId) {
+    // Superseded while asking — the session, if one opened, belongs to nobody.
+    if (result.ok) void api.cancelSession(result.value);
+    return;
+  }
+  if (result.ok) {
+    sessionId = result.value;
+    askInput.value = '';
+  } else {
+    dropLiveEntry();
+    setState('idle');
+    showError(result.error);
+  }
+}
+
+askForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const text = askInput.value.trim();
+  if (text === '' || askInput.disabled) return;
+  void submitAsk(text);
+});
+
+regenBtn.addEventListener('click', () => {
+  const q = entries[viewIndex]?.question.trim() ?? '';
+  if (q === '' || (state !== 'idle' && state !== 'answering')) return;
+  void submitAsk(q);
+});
+
 function setState(next: State): void {
   state = next;
   recordBtn.classList.toggle('recording', next === 'recording');
+  // The ask box stays usable while an answer streams (asking aborts the old
+  // session), but not while audio capture is in any stage of flight.
+  const askLocked = next === 'starting' || next === 'recording' || next === 'finalizing';
+  askInput.disabled = askLocked;
+  askBtn.disabled = askLocked;
   switch (next) {
     case 'idle':
       recordLabel.textContent = 'Record';
@@ -439,15 +508,19 @@ function renderEntry(): void {
   liveTag.hidden = !(state === 'recording' && viewingLive());
   genTag.hidden = !(state === 'answering' && viewingLive());
   copyBtn.hidden = !e || e.answer === '';
+  // Regenerate re-asks the viewed question; only offered when a question exists
+  // and no recording is in flight (answering is fine — main aborts the old run).
+  regenBtn.hidden = !(
+    e &&
+    e.question.trim() !== '' &&
+    (state === 'idle' || state === 'answering')
+  );
 
   const m = e?.metrics;
   if (m) {
     latencyTag.hidden = false;
-    latencyTag.textContent = `${(m.firstTokenMs / 1000).toFixed(1)}s to first word`;
-    latencyTag.title =
-      `First word ${Math.round(m.firstTokenMs)} ms after Stop · ` +
-      `transcript finalized ${Math.round(m.sttFinalizeMs)} ms · ` +
-      `full answer ${(m.totalMs / 1000).toFixed(1)} s`;
+    latencyTag.textContent = latencyLabel(m);
+    latencyTag.title = latencyTitle(m);
   } else {
     latencyTag.hidden = true;
   }
@@ -456,6 +529,7 @@ function renderEntry(): void {
   historyLabel.textContent = entries.length > 0 ? `${viewIndex + 1}/${entries.length}` : '';
   prevBtn.disabled = viewIndex <= 0;
   nextBtn.disabled = viewIndex >= entries.length - 1;
+  clearBtn.disabled = state !== 'idle' || entries.length === 0;
 }
 
 // ---------- UI wiring ----------
@@ -472,6 +546,17 @@ nextBtn.addEventListener('click', () => {
     viewIndex += 1;
     renderEntry();
   }
+});
+
+clearBtn.addEventListener('click', () => {
+  if (state !== 'idle' || entries.length === 0) return;
+  entries = [];
+  viewIndex = -1;
+  renderedIndex = -1;
+  renderEntry(); // placeholders return; the history bar hides itself
+  announce('History cleared');
+  // The button just vanished with its bar — don't strand keyboard focus.
+  recordBtn.focus();
 });
 
 // The global shortcut fires regardless of focus. Ignore it while Settings is
@@ -552,11 +637,6 @@ function announce(msg: string): void {
   srAnnounce.textContent = msg;
 }
 
-function errorMessage(err: unknown): string {
-  return err && typeof err === 'object' && 'message' in err
-    ? String((err as AppError).message)
-    : String(err);
-}
 function showError(err: unknown): void {
   errorBox.textContent = errorMessage(err);
   errorBox.hidden = false;
@@ -575,33 +655,32 @@ const STYLES: readonly string[] = ['brief', 'balanced', 'detailed'];
 const asProvider = (v: string): LlmProviderId => (PROVIDERS.includes(v) ? (v as LlmProviderId) : 'anthropic');
 const asStyle = (v: string): AnswerStyle => (STYLES.includes(v) ? (v as AnswerStyle) : 'balanced');
 
-/** Electron accelerator -> what the key caps actually say on Windows. */
-function formatAccelerator(accel: string): string {
-  return accel
-    .split('+')
-    .map((raw) => {
-      const p = raw.trim();
-      switch (p.toLowerCase()) {
-        case 'commandorcontrol':
-        case 'cmdorctrl':
-        case 'control':
-        case 'ctrl':
-          return 'Ctrl';
-        case 'command':
-        case 'cmd':
-        case 'super':
-        case 'meta':
-          return 'Win';
-        case 'option':
-        case 'alt':
-          return 'Alt';
-        case 'shift':
-          return 'Shift';
-        default:
-          return p.length === 1 ? p.toUpperCase() : p;
-      }
-    })
-    .join('+');
+// ---------- Answer-style quick toggle ----------
+// Flipping the style is latency-free by design: the cached prompt prefix is
+// split before the style suffix, so a flip never invalidates the cached
+// resume+JD block (see README, "Prompt caching, honestly").
+const styleChips = [
+  $<HTMLButtonElement>('styleBrief'),
+  $<HTMLButtonElement>('styleBalanced'),
+  $<HTMLButtonElement>('styleDetailed'),
+];
+
+function syncStyleChips(style: AnswerStyle): void {
+  for (const chip of styleChips) {
+    chip.setAttribute('aria-pressed', chip.dataset.style === style ? 'true' : 'false');
+  }
+}
+
+for (const chip of styleChips) {
+  chip.addEventListener('click', async () => {
+    try {
+      // Reflect what main persisted, not what was clicked.
+      const view = await api.saveSettings({ answerStyle: asStyle(chip.dataset.style ?? '') });
+      syncStyleChips(view.answerStyle);
+    } catch (err) {
+      showError(err);
+    }
+  });
 }
 
 /** Reflect hotkey state on the main view: the chip teaches it, the notice explains its absence. */
@@ -687,6 +766,7 @@ $('saveBtn').addEventListener('click', async () => {
     const view = await api.saveSettings(patch);
     settingsError.hidden = true;
     fillSettingsForm(view);
+    syncStyleChips(view.answerStyle); // keep the main-view chips honest too
     const savedNote = $('savedNote');
     savedNote.hidden = false;
     if (savedTimer) clearTimeout(savedTimer);
@@ -706,6 +786,7 @@ void (async () => {
   try {
     const s = await api.getSettings();
     applyHotkeyUi(s);
+    syncStyleChips(s.answerStyle);
     const missingLlmKey = s.llmProvider === 'groq' ? !s.hasGroqKey : !s.hasAnthropicKey;
     if ((!s.hasDeepgramKey || missingLlmKey) && state === 'idle') {
       statusText.textContent = 'First run: open Settings (gear icon) and add your API keys';

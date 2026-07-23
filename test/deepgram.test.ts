@@ -311,6 +311,21 @@ describe('DeepgramStream partial transcripts', () => {
     ]);
   });
 
+  test('a newer interim replaces the previous one instead of appending', async () => {
+    const { stream, ws } = await connected();
+    const seen: Array<[string, boolean]> = [];
+    stream.onPartial((t, f) => seen.push([t, f]));
+
+    ws.emitMessage(results('hel', false));
+    ws.emitMessage(results('hello wor', false));
+
+    // 'hel hello wor' here would mean interims were being accumulated like finals.
+    expect(seen).toEqual([
+      ['hel', false],
+      ['hello wor', false],
+    ]);
+  });
+
   test('ignores binary frames and frames it does not act on', async () => {
     const { stream, ws } = await connected();
     const seen: string[] = [];
@@ -421,6 +436,39 @@ describe('DeepgramStream.onError', () => {
     expect(errors[0]?.code).toBe('stt_error');
   });
 
+  // The queue must drain on first registration: replaying the same failure to
+  // every later registration would double-report one dead socket.
+  test('delivers a queued error exactly once across onError registrations', async () => {
+    const { stream, ws } = await connected();
+    ws.emitSocketError();
+
+    const first: AppError[] = [];
+    const second: AppError[] = [];
+    stream.onError((e) => first.push(e));
+    stream.onError((e) => second.push(e));
+
+    expect(first).toHaveLength(1);
+    expect(first[0]?.code).toBe('stt_error');
+    expect(second).toEqual([]);
+  });
+
+  // Once finalize has settled, the stream is over: a socket error trickling in
+  // afterwards (TCP reset on the socket we already dropped) is stale news, not
+  // a new failure to toast the user with.
+  test('ignores a socket error that arrives after the stream is already over', async () => {
+    vi.useFakeTimers();
+    const { stream, ws } = await connected();
+    const errors: AppError[] = [];
+    stream.onError((e) => errors.push(e));
+
+    const done = stream.finalize(5_000);
+    await vi.advanceTimersByTimeAsync(5_000); // server never closed; timeout tore down
+    await done;
+
+    ws.emitSocketError();
+    expect(errors).toEqual([]);
+  });
+
   test('does not replay a queued error to a stream that was aborted first', async () => {
     const { stream, ws } = await connected();
     ws.emitSocketError();
@@ -473,6 +521,59 @@ describe('DeepgramStream audio', () => {
     expect(internals.pending.length).toBeGreaterThan(0); // still buffering the newest audio
   });
 
+  // Order matters: the buffered audio IS the start of the question. Flushing it
+  // out of order would hand Deepgram shuffled speech.
+  test('flushes pre-open audio in arrival order once the socket opens', async () => {
+    vi.useFakeTimers();
+    const { stream, ws } = await connected();
+    const internals = stream as unknown as { open: boolean; handleOpen: () => void };
+    internals.open = false; // reproduce the CONNECTING window
+    stream.sendAudio(pcm(4));
+    stream.sendAudio(pcm(8));
+    stream.sendAudio(pcm(12));
+    expect(ws.audioFrames()).toEqual([]); // nothing hits the wire before open
+
+    internals.handleOpen();
+    expect(ws.audioFrames().map((b) => b.byteLength)).toEqual([4, 8, 12]);
+    stream.abort();
+  });
+
+  test('keeps everything at exactly the 160 KB boundary without dropping', async () => {
+    const { stream } = await connected();
+    const internals = stream as unknown as { open: boolean; pending: ArrayBuffer[]; pendingBytes: number };
+    internals.open = false;
+
+    for (let i = 0; i < 4; i++) stream.sendAudio(pcm(40_000));
+    expect(internals.pending.length).toBe(4); // at the cap is fine; over it is not
+    expect(internals.pendingBytes).toBe(160_000);
+  });
+
+  test('drops the oldest pre-open frame first once over the cap', async () => {
+    const { stream } = await connected();
+    const internals = stream as unknown as { open: boolean; pending: ArrayBuffer[]; pendingBytes: number };
+    internals.open = false;
+
+    stream.sendAudio(pcm(70_000));
+    stream.sendAudio(pcm(50_000));
+    stream.sendAudio(pcm(40_000)); // exactly 160 000 — still under the drop condition
+    stream.sendAudio(pcm(10_000)); // pushes over; the 70 000 frame must go, and only it
+
+    expect(internals.pending.map((b) => b.byteLength)).toEqual([50_000, 40_000, 10_000]);
+    expect(internals.pendingBytes).toBe(100_000);
+  });
+
+  // The `length > 1` clause in the drop loop: bounded memory must never mean
+  // throwing away the only audio we have.
+  test('keeps a lone oversized frame rather than dropping the only audio', async () => {
+    const { stream } = await connected();
+    const internals = stream as unknown as { open: boolean; pending: ArrayBuffer[]; pendingBytes: number };
+    internals.open = false;
+
+    stream.sendAudio(pcm(200_000));
+    expect(internals.pending.map((b) => b.byteLength)).toEqual([200_000]);
+    expect(internals.pendingBytes).toBe(200_000);
+  });
+
   test('drops buffered audio when the stream is torn down', async () => {
     const { stream } = await connected();
     const internals = stream as unknown as { open: boolean; pending: ArrayBuffer[]; pendingBytes: number };
@@ -506,6 +607,112 @@ describe('DeepgramStream.finalize', () => {
     const done = stream.finalize(5_000);
     ws.emitClose(1000, '');
     await expect(done).resolves.toBe('What is your greatest weakness');
+  });
+
+  // The whole point of CloseStream: Deepgram flushes what it is still holding
+  // before closing. Those tail frames arrive while we wait and must count.
+  test('counts a tail Results frame that lands between CloseStream and the close', async () => {
+    const { stream, ws } = await connected();
+    ws.emitMessage(results('What is your', true));
+
+    const done = stream.finalize(5_000);
+    ws.emitMessage(results('greatest weakness?', true)); // the flush CloseStream asked for
+    ws.emitClose(1000, '');
+
+    await expect(done).resolves.toBe('What is your greatest weakness?');
+  });
+
+  // Once CloseStream is out the socket is CLOSING: a straggler capture frame
+  // can no longer influence the transcript, and a send failure on it must not
+  // report a bogus mid-recording error for a stop that is succeeding.
+  test('drops audio sent after finalize has asked for the close', async () => {
+    const { stream, ws } = await connected();
+    const errors: AppError[] = [];
+    stream.onError((e) => errors.push(e));
+    ws.emitMessage(results('done talking', true));
+
+    const done = stream.finalize(5_000);
+    ws.sent = [];
+    ws.sendError = new Error('socket is CLOSING');
+    stream.sendAudio(pcm(64)); // a straggler frame from the capture pipeline
+
+    expect(ws.audioFrames()).toEqual([]);
+    expect(errors).toEqual([]);
+
+    ws.sendError = null;
+    ws.emitClose(1000, '');
+    await expect(done).resolves.toBe('done talking');
+  });
+
+  // abort() during the close wait must release finalize immediately — a new
+  // recording is starting and nobody will ever emit the close it waits for.
+  test('abort() during the close wait settles finalize at once with what was heard', async () => {
+    vi.useFakeTimers();
+    const { stream, ws } = await connected();
+    const errors: AppError[] = [];
+    stream.onError((e) => errors.push(e));
+    ws.emitMessage(results('so far', true));
+
+    const done = stream.finalize(5_000);
+    stream.abort();
+
+    await expect(done).resolves.toBe('so far'); // no timer advance: it must settle on its own
+    expect(errors).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  // Waiting on a socket that is not open would burn the entire timeout budget
+  // (straight onto stop-to-first-word) before returning this same string.
+  test('resolves at once when the socket is not open, without burning the timeout', async () => {
+    vi.useFakeTimers();
+    const { stream, ws } = await connected();
+    ws.emitMessage(results('caught before the drop', true));
+    (stream as unknown as { open: boolean }).open = false; // the socket regressed under us
+
+    await expect(stream.finalize(5_000)).resolves.toBe('caught before the drop');
+    expect(ws.closeCalls).toBeGreaterThan(0); // the dead socket is released
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  // After the timeout teardown, finalize() has already resolved: a late frame
+  // firing partials would show the user a transcript that contradicts the
+  // answer being generated from the returned one.
+  test('ignores frames that arrive after the finalize timeout tore the stream down', async () => {
+    vi.useFakeTimers();
+    const { stream, ws } = await connected();
+    const seen: string[] = [];
+    stream.onPartial((t) => seen.push(t));
+    ws.emitMessage(results('heard', true));
+
+    const done = stream.finalize(5_000);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(done).resolves.toBe('heard');
+
+    seen.length = 0;
+    ws.emitMessage(results('heard plus a late tail', true));
+    expect(seen).toEqual([]);
+    await expect(stream.finalize(5_000)).resolves.toBe('heard'); // the answer did not shift
+  });
+
+  test('an empty final leaves no gap in the joined transcript', async () => {
+    const { stream, ws } = await connected();
+    ws.emitMessage(results('first part', true));
+    ws.emitMessage(results('', true)); // Deepgram finalizing a silent stretch
+    ws.emitMessage(results('second part', true));
+
+    const done = stream.finalize(5_000);
+    ws.emitClose(1000, '');
+    await expect(done).resolves.toBe('first part second part');
+  });
+
+  test('a whitespace-only trailing interim resolves to a trimmed transcript', async () => {
+    const { stream, ws } = await connected();
+    ws.emitMessage(results('question here', true));
+    ws.emitMessage(results('   ', false));
+
+    const done = stream.finalize(5_000);
+    ws.emitClose(1000, '');
+    await expect(done).resolves.toBe('question here');
   });
 
   test('does not report the close it asked for as an error', async () => {
@@ -630,6 +837,40 @@ describe('DeepgramStream keepalive', () => {
 
     await vi.advanceTimersByTimeAsync(60_000);
     expect(ws.controlFrames()).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  // A KeepAlive after CloseStream is at best ignored by Deepgram; at worst the
+  // socket is already CLOSING and the send blows up mid-flush (next test).
+  test('sends no KeepAlive once finalize has asked for the close', async () => {
+    vi.useFakeTimers();
+    const { stream, ws } = await connected();
+
+    const done = stream.finalize(20_000); // wait window longer than the keepalive interval
+    ws.sent = [];
+    await vi.advanceTimersByTimeAsync(8_000); // one full keepalive tick into the wait
+
+    expect(ws.controlFrames()).toEqual([]);
+    ws.emitClose(1000, '');
+    await done;
+  });
+
+  // The user pressed Stop and the flush is in progress: a keepalive tick
+  // discovering the dying socket must not toast a "lost connection" error for
+  // a stop that is actually succeeding — finalize returns what was heard.
+  test('a socket dying during the close wait does not surface a spurious error', async () => {
+    vi.useFakeTimers();
+    const { stream, ws } = await connected();
+    const errors: AppError[] = [];
+    stream.onError((e) => errors.push(e));
+    ws.emitMessage(results('kept', true));
+
+    const done = stream.finalize(20_000);
+    ws.sendError = new Error('socket is CLOSING');
+    await vi.advanceTimersByTimeAsync(20_000); // crosses the 8 s keepalive tick, then times out
+
+    await expect(done).resolves.toBe('kept');
+    expect(errors).toEqual([]);
     expect(vi.getTimerCount()).toBe(0);
   });
 

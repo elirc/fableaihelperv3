@@ -58,8 +58,14 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks(); // fs spies must not leak into the next test's file IO
   fs.rmSync(rootDir, { recursive: true, force: true });
 });
+
+/** What the mocked safeStorage produces for `value`, as stored on disk. */
+function encBlob(value: string): string {
+  return 'enc:' + Buffer.from(`dpapi:${Buffer.from(value, 'utf8').toString('hex')}`, 'utf8').toString('base64');
+}
 
 describe('store defaults aliasing', () => {
   // Regression: load() used `{ ...DEFAULTS, ...JSON.parse(file) }`. A file with
@@ -134,6 +140,21 @@ describe('store validation of settings.json', () => {
     expect(v.llmProvider).toBe('anthropic'); // only the bad field resets
   });
 
+  test('a malformed entry inside secrets does not cost the other keys', async () => {
+    writeSettings({
+      resume: 'keep',
+      secrets: { deepgramKey: 42, anthropicKey: encBlob('sk-keep'), groqKey: { nested: true } },
+    });
+    const store = await freshStore();
+
+    const v = store.getSettingsView();
+    expect(v.hasDeepgramKey).toBe(false); // bad type dropped
+    expect(v.hasGroqKey).toBe(false); // bad type dropped
+    expect(v.hasAnthropicKey).toBe(true); // good sibling survives
+    expect(store.getSecret('anthropicKey')).toBe('sk-keep');
+    expect(v.resume).toBe('keep');
+  });
+
   test.each([
     ['unparseable json', 'garbage { not json'],
     ['a bare scalar', '"just a string"'],
@@ -196,12 +217,46 @@ describe('store secrets', () => {
     expect(readSettings().secrets?.deepgramKey).toBeUndefined();
   });
 
+  // Regression: the trim used to happen after the empty-string check, so a
+  // pasted run of spaces encrypted '' — hasKey said "key present" while
+  // getSecret returned '', and sessions failed with a confusing no-key error.
+  test('a whitespace-only value clears the key like an empty string does', async () => {
+    const store = await freshStore();
+    store.applySettingsPatch({ deepgramKey: 'dg-1' });
+    store.applySettingsPatch({ deepgramKey: '   ' });
+
+    expect(store.getSettingsView().hasDeepgramKey).toBe(false);
+    expect(store.getSecret('deepgramKey')).toBe('');
+    expect(readSettings().secrets?.deepgramKey).toBeUndefined();
+  });
+
   test('a key copied from another machine is treated as unset, not a crash', async () => {
     writeSettings({ secrets: { deepgramKey: 'enc:' + Buffer.from('someone elses dpapi blob').toString('base64') } });
     const store = await freshStore();
 
     expect(() => store.getSecret('deepgramKey')).not.toThrow();
     expect(store.getSecret('deepgramKey')).toBe('');
+    // Deliberate asymmetry: hasKey reflects "a blob is stored", so Settings
+    // shows a key the user can replace instead of pretending the slot is empty.
+    expect(store.getSettingsView().hasDeepgramKey).toBe(true);
+  });
+
+  test('an unrecognized storage prefix reads as unset instead of leaking the raw value', async () => {
+    writeSettings({ secrets: { groqKey: 'v1$some-future-or-corrupt-format' } });
+    const store = await freshStore();
+
+    expect(store.getSecret('groqKey')).toBe('');
+    expect(store.getSettingsView().hasGroqKey).toBe(true); // same replace-me behavior as above
+  });
+
+  test('no plaintext and no ciphertext ever appears in the renderer view', async () => {
+    const store = await freshStore();
+    store.applySettingsPatch({ deepgramKey: 'dg-p', anthropicKey: 'sk-ant-p', groqKey: 'gsk-p' });
+
+    const serialized = JSON.stringify(store.getSettingsView());
+    for (const leak of ['dg-p', 'sk-ant-p', 'gsk-p', 'enc:', 'plain:', 'secrets']) {
+      expect(serialized).not.toContain(leak);
+    }
   });
 
   test('falls back to marked plaintext when the OS keystore is unavailable', async () => {
@@ -211,6 +266,47 @@ describe('store secrets', () => {
 
     expect(readSettings().secrets?.groqKey).toMatch(/^plain:/);
     expect(store.getSecret('groqKey')).toBe('gsk-1');
+  });
+});
+
+describe('store patch semantics', () => {
+  test('an empty patch changes nothing', async () => {
+    const store = await freshStore();
+    store.applySettingsPatch({ resume: 'r', deepgramKey: 'dg' });
+    const before = store.getSettingsView();
+
+    expect(store.applySettingsPatch({})).toEqual(before);
+    expect(store.getSecret('deepgramKey')).toBe('dg');
+  });
+
+  test('undefined fields are left untouched; only named fields change', async () => {
+    const store = await freshStore();
+    store.applySettingsPatch({ resume: 'r1', jobDescription: 'jd1', answerStyle: 'brief', groqKey: 'gsk' });
+    store.applySettingsPatch({ resume: 'r2' });
+
+    const v = store.getSettingsView();
+    expect(v.resume).toBe('r2');
+    expect(v.jobDescription).toBe('jd1');
+    expect(v.answerStyle).toBe('brief');
+    expect(v.hasGroqKey).toBe(true);
+  });
+
+  test('resume and job description are stored verbatim, not trimmed', async () => {
+    // Unlike keys and the hotkey, profile text formatting belongs to the user.
+    const store = await freshStore();
+    store.applySettingsPatch({ resume: '  indented resume\nline two  ' });
+    store.resetCacheForTests();
+
+    expect(store.getSettingsView().resume).toBe('  indented resume\nline two  ');
+  });
+
+  test('an empty string is a real value for plain fields, not a clear', async () => {
+    const store = await freshStore();
+    store.applySettingsPatch({ resume: 'something' });
+    store.applySettingsPatch({ resume: '' });
+    store.resetCacheForTests();
+
+    expect(store.getSettingsView().resume).toBe('');
   });
 });
 
@@ -262,15 +358,67 @@ describe('store hotkeyRegistered', () => {
     store.applySettingsPatch({ hotkey: 'Control+Alt+J' });
     expect(readSettings()).not.toHaveProperty('hotkeyRegistered');
   });
+
+  test('resetCacheForTests drops the flag along with the cache', async () => {
+    const store = await freshStore();
+    store.setHotkeyRegistered(true);
+    store.resetCacheForTests();
+
+    // A fresh load must report "nothing registered yet this run".
+    expect(store.getSettingsView().hotkeyRegistered).toBe(false);
+  });
 });
 
 describe('store persistence', () => {
+  // Regression: applySettingsPatch used to mutate the cache before persist(),
+  // so a failed write left memory claiming a value the disk never got.
+  test('a failed write does not leave the cache diverged from disk', async () => {
+    const store = await freshStore();
+    store.applySettingsPatch({ resume: 'saved' });
+
+    vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => {
+      throw new Error('disk full');
+    });
+    expect(() => store.applySettingsPatch({ resume: 'lost' })).toThrow('disk full');
+
+    // In-memory state still matches what is actually on disk…
+    expect(store.getSettingsView().resume).toBe('saved');
+    // …and the disk really does hold the old value.
+    store.resetCacheForTests();
+    expect(store.getSettingsView().resume).toBe('saved');
+  });
+
   test('writes atomically and leaves no partial file behind', async () => {
     const store = await freshStore();
     store.applySettingsPatch({ resume: 'r' });
 
     expect(fs.existsSync(`${settingsPath()}.tmp`)).toBe(false);
     expect(readSettings().resume).toBe('r');
+  });
+
+  test('persists by writing a tmp file first and renaming it over settings.json', async () => {
+    const store = await freshStore();
+    const writeSpy = vi.spyOn(fs, 'writeFileSync');
+    const renameSpy = vi.spyOn(fs, 'renameSync');
+    store.applySettingsPatch({ resume: 'r' });
+
+    // The real file is only ever touched by the rename, never a direct write.
+    const tmp = `${settingsPath()}.tmp`;
+    expect(writeSpy).toHaveBeenCalledTimes(1);
+    expect(writeSpy).toHaveBeenCalledWith(tmp, expect.stringContaining('"resume": "r"'));
+    expect(renameSpy).toHaveBeenCalledExactlyOnceWith(tmp, settingsPath());
+    expect(writeSpy.mock.invocationCallOrder[0]!).toBeLessThan(renameSpy.mock.invocationCallOrder[0]!);
+  });
+
+  test('reading settings never creates the file — only a save does', async () => {
+    const store = await freshStore();
+    store.getSettingsView();
+    store.getProfile();
+    expect(fs.existsSync(settingsPath())).toBe(false);
+
+    store.applySettingsPatch({ alwaysOnTop: false });
+    expect(fs.existsSync(settingsPath())).toBe(true);
+    expect(store.getAlwaysOnTop()).toBe(false);
   });
 
   test('creates the userData directory on first save', async () => {

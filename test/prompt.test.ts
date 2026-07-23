@@ -50,6 +50,30 @@ describe('buildSystemPrompt', () => {
     expect(whole.startsWith(cachedPrefix)).toBe(true);
     expect(whole.endsWith(styleSuffix)).toBe(true);
   });
+
+  // Exact concatenation, not just startsWith/endsWith: an extra character
+  // between the blocks would make the single-string prompt (Groq) diverge from
+  // the two-block prompt (Anthropic) and the styles would drift apart per provider.
+  test('is exactly cachedPrefix + blank line + styleSuffix for every style', () => {
+    for (const style of STYLES) {
+      const { cachedPrefix, styleSuffix } = buildSystemPromptBlocks('r', 'j', style);
+      expect(buildSystemPrompt('r', 'j', style)).toBe(cachedPrefix + '\n\n' + styleSuffix);
+    }
+  });
+
+  test('resume-only profile omits the JD section but keeps the grounding clause', () => {
+    const { cachedPrefix } = buildSystemPromptBlocks('payments systems', '', 'balanced');
+    expect(cachedPrefix).toContain("--- THE USER'S RESUME ---");
+    expect(cachedPrefix).not.toContain('--- THE JOB THEY ARE INTERVIEWING FOR ---');
+    expect(cachedPrefix).toMatch(/Ground every answer/);
+  });
+
+  test('JD-only profile omits the resume section but keeps the grounding clause', () => {
+    const { cachedPrefix } = buildSystemPromptBlocks('', 'Senior Backend Engineer', 'balanced');
+    expect(cachedPrefix).not.toContain("--- THE USER'S RESUME ---");
+    expect(cachedPrefix).toContain('--- THE JOB THEY ARE INTERVIEWING FOR ---');
+    expect(cachedPrefix).toMatch(/Ground every answer/);
+  });
 });
 
 describe('answerStyle', () => {
@@ -93,6 +117,20 @@ describe('answerStyle', () => {
     expect(new Set(prefixes).size).toBe(1);
   });
 
+  test('the cached prefix is byte-identical across styles for an empty profile too', () => {
+    const prefixes = STYLES.map((s) => buildSystemPromptBlocks('', '', s).cachedPrefix);
+    expect(new Set(prefixes).size).toBe(1);
+  });
+
+  test('an unknown style still leaves the cached prefix untouched', () => {
+    // The fallback must live entirely in the suffix: if it ever leaked into the
+    // prefix, a corrupt settings file would silently invalidate the cache.
+    const good = buildSystemPromptBlocks('resume', 'jd', 'balanced');
+    const bad = buildSystemPromptBlocks('resume', 'jd', 'wat' as AnswerStyle);
+    expect(bad.cachedPrefix).toBe(good.cachedPrefix);
+    expect(bad.styleSuffix).toBe(good.styleSuffix);
+  });
+
   test('the style instruction is not duplicated into the cached prefix', () => {
     const { cachedPrefix, styleSuffix } = buildSystemPromptBlocks('resume', 'jd', 'brief');
     expect(cachedPrefix).not.toContain(styleSuffix);
@@ -112,6 +150,19 @@ describe('buildUserMessage', () => {
     const m = buildUserMessage('Tell me about yourself.');
     expect(m).toContain('Tell me about yourself.');
     expect(m).toMatch(/What should I say\?/);
+  });
+
+  // Pinned exactly: the user turn is part of every request, and any accidental
+  // wording drift here would change token counts and model behaviour silently.
+  test('produces the exact wrapping format', () => {
+    expect(buildUserMessage('Why Go?')).toBe(
+      'The other person on the call just said:\n"""\nWhy Go?\n"""\n\nWhat should I say?',
+    );
+  });
+
+  test('passes the transcript through verbatim, including newlines and quotes', () => {
+    const transcript = 'Line one.\nLine two with "quotes".';
+    expect(buildUserMessage(transcript)).toContain(transcript);
   });
 
   test('does not carry the answer style, so the user turn stays cache-neutral', () => {

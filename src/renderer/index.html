@@ -33,11 +33,25 @@
       <div class="timer" id="timer" aria-hidden="true"></div>
     </div>
 
+    <form id="askForm" class="ask-row">
+      <label class="sr-only" for="askInput">Type a question</label>
+      <input type="text" id="askInput" placeholder="Or type the question here…" autocomplete="off" spellcheck="false" />
+      <button id="askBtn" class="ask-btn" type="submit">Ask</button>
+    </form>
+
+    <div class="style-row" role="group" aria-label="Answer style">
+      <span class="style-label" aria-hidden="true">Style</span>
+      <button id="styleBrief" class="chip" type="button" data-style="brief" aria-pressed="false">Brief</button>
+      <button id="styleBalanced" class="chip" type="button" data-style="balanced" aria-pressed="false">Balanced</button>
+      <button id="styleDetailed" class="chip" type="button" data-style="detailed" aria-pressed="false">Detailed</button>
+    </div>
+
     <section class="panel" aria-labelledby="transcriptTitle">
       <div class="panel-title">
         <span id="transcriptTitle">Question heard</span>
         <span class="live-tag" id="liveTag" hidden>live</span>
         <div class="history" id="historyBar" role="group" aria-label="Answer history" hidden>
+          <button id="clearBtn" class="nav-btn clear-btn" type="button" aria-label="Clear history" title="Clear history">Clear</button>
           <button id="prevBtn" class="nav-btn" type="button" aria-label="Previous question">&#8249;</button>
           <span class="history-label" id="historyLabel"></span>
           <button id="nextBtn" class="nav-btn" type="button" aria-label="Next question">&#8250;</button>
@@ -51,7 +65,10 @@
         <span id="answerTitle">Suggested answer</span>
         <span class="gen-tag" id="genTag" hidden>generating…</span>
         <span class="latency" id="latencyTag" hidden></span>
-        <button id="copyBtn" class="mini-btn" type="button" aria-label="Copy answer" hidden><span id="copyLabel">Copy</span></button>
+        <div class="title-actions">
+          <button id="regenBtn" class="mini-btn" type="button" aria-label="Regenerate answer" hidden><span aria-hidden="true">&#8635;</span> Regenerate</button>
+          <button id="copyBtn" class="mini-btn" type="button" aria-label="Copy answer" hidden><span id="copyLabel">Copy</span></button>
+        </div>
       </div>
       <div class="panel-body md" id="answerBox" aria-live="polite" aria-atomic="false" tabindex="0"><span class="placeholder">Your AI-suggested answer will stream here.</span></div>
     </section>

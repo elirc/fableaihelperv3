@@ -81,6 +81,9 @@ const anthropic = () => createAnthropicProvider('sk-test', 'resume', 'jd', 'bala
 const groq = () => createGroqProvider('gsk-test', 'resume', 'jd', 'balanced');
 const noop = (): void => {};
 
+/** Signature for fetch mocks whose recorded calls the test inspects. */
+type FetchArgs = [input: string | URL | Request, init?: RequestInit];
+
 describe('anthropic provider — happy path', () => {
   test('streams deltas and returns exactly what was streamed', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => anthropicStream([['Hello', ', ', 'world']])));
@@ -106,7 +109,7 @@ describe('anthropic provider — happy path', () => {
   });
 
   test('sends the resume+JD as a cached block and the style as a separate uncached block', async () => {
-    const fetchMock = vi.fn(async () => anthropicStream([['ok']]));
+    const fetchMock = vi.fn(async (..._args: FetchArgs) => anthropicStream([['ok']]));
     vi.stubGlobal('fetch', fetchMock);
     await anthropic().generate('q', noop, new AbortController().signal);
 
@@ -130,6 +133,14 @@ describe('anthropic provider — error mapping', () => {
     expect(err.message).toMatch(/Settings/);
   });
 
+  test('403 maps to llm_auth and names the model the key cannot use', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => apiError(403, 'permission_error', 'not allowed')));
+    const err = await catchError(() => anthropic().generate('q', noop, new AbortController().signal));
+    expect(err.code).toBe('llm_auth');
+    expect(err.message).toContain('403');
+    expect(err.message).toContain('claude-haiku-4-5');
+  });
+
   test('429 maps to llm_rate_limit with actionable advice, not llm_http', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => apiError(429, 'rate_limit_error', 'slow down')));
     const err = await catchError(() => anthropic().generate('q', noop, new AbortController().signal));
@@ -149,6 +160,41 @@ describe('anthropic provider — error mapping', () => {
     const err = await catchError(() => anthropic().generate('q', noop, new AbortController().signal));
     expect(err.code).toBe('llm_http');
     expect(err.message).toContain('400');
+  });
+
+  test('404 maps to llm_http with the status visible (model retired out from under us)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => apiError(404, 'not_found_error', 'model not found')));
+    const err = await catchError(() => anthropic().generate('q', noop, new AbortController().signal));
+    expect(err.code).toBe('llm_http');
+    expect(err.message).toContain('404');
+  });
+
+  // 500 must reach the generic HTTP branch, not the retry: with maxRetries: 0
+  // and our own retry scoped to connection errors, a server error is reported
+  // on the first attempt.
+  test('500 maps to llm_http with the status visible, without a retry', async () => {
+    const fetchMock = vi.fn(async () => apiError(500, 'api_error', 'internal error'));
+    vi.stubGlobal('fetch', fetchMock);
+    const err = await catchError(() => anthropic().generate('q', noop, new AbortController().signal));
+    expect(err.code).toBe('llm_http');
+    expect(err.message).toContain('500');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // Precedence: once the caller aborted, whatever error the SDK happened to be
+  // holding (here a 500) is noise — the session manager shows nothing for
+  // 'aborted', and that is what the user who pressed record again expects.
+  test('an abort wins over a concurrent HTTP error', async () => {
+    const ac = new AbortController();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        ac.abort();
+        return apiError(500, 'api_error', 'internal error');
+      }),
+    );
+    const err = await catchError(() => anthropic().generate('q', noop, ac.signal));
+    expect(err.code).toBe('aborted');
   });
 
   // The headline regression. APIUserAbortError extends APIError with
@@ -313,7 +359,7 @@ describe('groq provider', () => {
   });
 
   test('pins the model to a non-deprecated id and suppresses reasoning for latency', async () => {
-    const fetchMock = vi.fn(async () => groqStream(groqLine('x') + 'data: [DONE]\n\n'));
+    const fetchMock = vi.fn(async (..._args: FetchArgs) => groqStream(groqLine('x') + 'data: [DONE]\n\n'));
     vi.stubGlobal('fetch', fetchMock);
     await groq().generate('q', noop, new AbortController().signal);
 
@@ -326,10 +372,60 @@ describe('groq provider', () => {
     expect(body.stream).toBe(true);
   });
 
+  // Parity with anthropic.ts's MAX_TOKENS: spoken answers are short, and an
+  // uncapped runaway completion is pure tail latency.
+  test('caps the completion length so a runaway answer cannot stream forever', async () => {
+    const fetchMock = vi.fn(async (..._args: FetchArgs) => groqStream(groqLine('x') + 'data: [DONE]\n\n'));
+    vi.stubGlobal('fetch', fetchMock);
+    await groq().generate('q', noop, new AbortController().signal);
+
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const body = JSON.parse(String(init.body));
+    expect(body.max_completion_tokens).toBe(1024);
+  });
+
+  // Our TextDecoder path, not the parser's: decode(value, {stream: true}) must
+  // hold back a half-received multi-byte sequence instead of emitting U+FFFD.
+  // Delivering the body one byte at a time guarantees every multi-byte char in
+  // the payload is split across reads.
+  test('multi-byte UTF-8 split across network chunks is reassembled, not corrupted', async () => {
+    const bytes = new TextEncoder().encode(groqLine('café — ☕') + 'data: [DONE]\n\n');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                for (const byte of bytes) controller.enqueue(new Uint8Array([byte]));
+                controller.close();
+              },
+            }),
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          ),
+      ),
+    );
+
+    const deltas: string[] = [];
+    const full = await groq().generate('q', (d) => deltas.push(d), new AbortController().signal);
+    expect(full).toBe('café — ☕');
+    expect(full).not.toContain('�');
+    expect(deltas.join('')).toBe(full);
+  });
+
   test('401 maps to llm_auth', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 401 })));
     const err = await catchError(() => groq().generate('q', noop, new AbortController().signal));
     expect(err.code).toBe('llm_auth');
+    expect(err.message).toContain('401');
+  });
+
+  test('403 maps to llm_auth and reports 403, not a misleading 401', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('forbidden', { status: 403 })));
+    const err = await catchError(() => groq().generate('q', noop, new AbortController().signal));
+    expect(err.code).toBe('llm_auth');
+    expect(err.message).toContain('403');
+    expect(err.message).not.toContain('401');
   });
 
   test('429 maps to llm_rate_limit', async () => {
@@ -350,6 +446,21 @@ describe('groq provider', () => {
     const err = await catchError(() => groq().generate('q', noop, new AbortController().signal));
     expect(err.code).toBe('llm_http');
     expect(err.message).toMatch(/unavailable/i);
+  });
+
+  test('500 maps to llm_http with the status visible', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 500 })));
+    const err = await catchError(() => groq().generate('q', noop, new AbortController().signal));
+    expect(err.code).toBe('llm_http');
+    expect(err.message).toContain('500');
+  });
+
+  test('an unmapped 4xx keeps the status and a body snippet for debugging', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('json parse failure', { status: 422 })));
+    const err = await catchError(() => groq().generate('q', noop, new AbortController().signal));
+    expect(err.code).toBe('llm_http');
+    expect(err.message).toContain('422');
+    expect(err.message).toContain('json parse failure');
   });
 
   // Regression: this used to be `res.body!.getReader()`, which threw a raw
@@ -421,5 +532,134 @@ describe('groq provider', () => {
     const err = await catchError(() => groq().generate('q', noop, new AbortController().signal));
     expect(err.code).toBe('llm_http');
     expect(err.message).toMatch(/dropped/i);
+  });
+});
+
+describe('groq provider — single retry on connection failure', () => {
+  function groqStream(body: string): Response {
+    return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  }
+  function groqLine(content: string): string {
+    return 'data: ' + JSON.stringify({ choices: [{ delta: { content } }] }) + '\n\n';
+  }
+
+  test('retries once and succeeds when the initial fetch rejects', async () => {
+    let calls = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        calls += 1;
+        if (calls === 1) throw new TypeError('fetch failed');
+        return groqStream(groqLine('recovered') + 'data: [DONE]\n\n');
+      }),
+    );
+    const deltas: string[] = [];
+    const full = await groq().generate('q', (d) => deltas.push(d), new AbortController().signal);
+
+    expect(calls).toBe(2);
+    expect(full).toBe('recovered');
+    expect(deltas).toEqual(['recovered']); // exactly one answer on screen
+  });
+
+  test('retries at most once, then reports a clean connection error', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError('fetch failed');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const err = await catchError(() => groq().generate('q', noop, new AbortController().signal));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(err.code).toBe('llm_http');
+    expect(err.message).toMatch(/Could not reach Groq/);
+  });
+
+  test('re-sends a byte-identical request body on the retry', async () => {
+    let calls = 0;
+    const fetchMock = vi.fn(async (..._args: FetchArgs) => {
+      calls += 1;
+      if (calls === 1) throw new TypeError('fetch failed');
+      return groqStream(groqLine('ok') + 'data: [DONE]\n\n');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await groq().generate('q', noop, new AbortController().signal);
+
+    const first = (fetchMock.mock.calls[0]?.[1] as RequestInit).body;
+    const second = (fetchMock.mock.calls[1]?.[1] as RequestInit).body;
+    expect(second).toBe(first);
+  });
+
+  test('does not retry a request aborted in flight', async () => {
+    const ac = new AbortController();
+    // The request starts, then the session cancels it (user hit record again).
+    const fetchMock = vi.fn(async () => {
+      ac.abort();
+      throw abortError();
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const err = await catchError(() => groq().generate('q', noop, ac.signal));
+    expect(err.code).toBe('aborted');
+    expect(fetchMock).toHaveBeenCalledTimes(1); // a retry here would race the new session
+  });
+
+  test('does not retry an HTTP error status — the server heard us and said no', async () => {
+    const fetchMock = vi.fn(async () => new Response('slow down', { status: 429 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await catchError(() => groq().generate('q', noop, new AbortController().signal));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not retry a 5xx either', async () => {
+    const fetchMock = vi.fn(async () => new Response('boom', { status: 503 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await catchError(() => groq().generate('q', noop, new AbortController().signal));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('never retries a mid-stream drop after a delta reached the panel', async () => {
+    // The retry is scoped to the initial fetch rejection. Once the response
+    // body is streaming, a second attempt would concatenate two answers in the
+    // renderer, which appends deltas as they arrive. Pull-based so the first
+    // chunk is actually delivered (and painted) before the connection dies —
+    // erroring synchronously in start() would discard the queued chunk.
+    let pulls = 0;
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream({
+            pull(controller) {
+              pulls += 1;
+              if (pulls === 1) controller.enqueue(new TextEncoder().encode(groqLine('half')));
+              else controller.error(new TypeError('terminated'));
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const deltas: string[] = [];
+    const err = await catchError(() => groq().generate('q', (d) => deltas.push(d), new AbortController().signal));
+    expect(err.code).toBe('llm_http');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(deltas).toEqual(['half']); // not ['half', 'half']
+  });
+
+  test('an abort that arrives between the two attempts maps to aborted, not llm_http', async () => {
+    const ac = new AbortController();
+    let calls = 0;
+    const fetchMock = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) throw new TypeError('fetch failed'); // genuine network failure...
+      ac.abort(); // ...but the user cancels while the retry is in flight
+      throw abortError();
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const err = await catchError(() => groq().generate('q', noop, ac.signal));
+    expect(err.code).toBe('aborted');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

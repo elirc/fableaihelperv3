@@ -150,7 +150,11 @@ export function getSettingsView(): SettingsView {
 }
 
 export function applySettingsPatch(patch: SettingsPatch): SettingsView {
-  const s = load();
+  const cur = load();
+  // Work on a copy and commit only after the write lands: if encryptKey or
+  // persist throws (keystore hiccup, disk full), the cache still matches disk
+  // instead of holding a half-applied patch the next launch silently loses.
+  const s: StoreShape = { ...cur, secrets: { ...cur.secrets } };
   if (patch.resume !== undefined) s.resume = patch.resume;
   if (patch.jobDescription !== undefined) s.jobDescription = patch.jobDescription;
   if (patch.alwaysOnTop !== undefined) s.alwaysOnTop = patch.alwaysOnTop;
@@ -160,10 +164,14 @@ export function applySettingsPatch(patch: SettingsPatch): SettingsView {
   for (const key of ['deepgramKey', 'anthropicKey', 'groqKey'] as const) {
     const v = patch[key];
     if (v === undefined) continue;
-    if (v === '') delete s.secrets[key];
-    else s.secrets[key] = encryptKey(v.trim());
+    // Trim before the empty check: a pasted run of spaces must clear the key,
+    // not encrypt '' and leave hasKey claiming a key that cannot authenticate.
+    const trimmed = v.trim();
+    if (trimmed === '') delete s.secrets[key];
+    else s.secrets[key] = encryptKey(trimmed);
   }
   persist(s);
+  cache = s;
   return getSettingsView();
 }
 

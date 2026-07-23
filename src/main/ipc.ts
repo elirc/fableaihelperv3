@@ -6,6 +6,7 @@ import { SessionManager, toAppError, type LlmProvider, type SttStream } from './
 import { DeepgramStream } from './stt/deepgram';
 import { createAnthropicProvider } from './llm/anthropic';
 import { createGroqProvider } from './llm/groq';
+import { warmLlmConnection } from './llm/warm';
 
 const settingsPatchSchema = z
   .object({
@@ -23,6 +24,9 @@ const settingsPatchSchema = z
   .partial();
 
 const sessionIdSchema = z.number().int().positive();
+// A typed question: non-empty once trimmed, and bounded so a paste accident
+// cannot ship a novel to the LLM.
+const askTextSchema = z.string().trim().min(1).max(8_000);
 
 function ok<T>(value: T): Result<T> {
   return { ok: true, value };
@@ -101,10 +105,27 @@ export function registerIpc(getWin: () => BrowserWindow | null, applyHotkey: () 
   });
 
   ipcMain.handle('session:start', async (): Promise<Result<number>> => {
+    // Pre-warm the LLM origin while the user is still recording: the TCP+TLS
+    // handshake completes in the background, so the answer request after Stop
+    // reuses a pooled connection instead of paying it inside the
+    // stop-to-first-word window. Fire-and-forget, internally throttled.
+    warmLlmConnection(store.getProfile().llmProvider);
     try {
       return ok(await sessions.start());
     } catch (err) {
       return fail(toAppError(err, 'stt_connect'));
+    }
+  });
+
+  ipcMain.handle('session:ask', async (_e, raw): Promise<Result<number>> => {
+    // Typed questions skip STT entirely, so the LLM handshake is the whole
+    // pre-answer critical path — start it before the session even spins up.
+    warmLlmConnection(store.getProfile().llmProvider);
+    try {
+      const text = askTextSchema.parse(raw);
+      return ok(await sessions.ask(text));
+    } catch (err) {
+      return fail(toAppError(err, 'internal'));
     }
   });
 
@@ -117,6 +138,10 @@ export function registerIpc(getWin: () => BrowserWindow | null, applyHotkey: () 
 
   ipcMain.handle('session:stop', async (_e, raw): Promise<Result<null>> => {
     const sessionId = sessionIdSchema.parse(raw);
+    // The highest-value warm: fired BEFORE awaiting stop, so the TLS handshake
+    // overlaps the STT finalize and the LLM request that follows lands on a
+    // connection that is already hot.
+    warmLlmConnection(store.getProfile().llmProvider);
     // Pipeline errors arrive as session:error events, so stop itself normally
     // "succeeds". The exception is a session the manager no longer has: the
     // renderer is waiting on events that will never fire, so the only way it

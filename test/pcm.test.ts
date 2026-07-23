@@ -26,6 +26,33 @@ describe('downsample', () => {
     expect(() => downsample(new Float32Array(4), 16000, 48000)).toThrow();
   });
 
+  test('returns an empty output for an empty input', () => {
+    expect(downsample(new Float32Array(0), 48000, 16000).length).toBe(0);
+  });
+
+  // Ratio 1.5 produces the narrowest windows the algorithm ever sees: a single
+  // sample. `end > start` must still hold, and a 1-sample average is the sample.
+  test('averages the 1-and-2-sample windows of a 1.5 ratio (24k->16k)', () => {
+    const out = downsample(Float32Array.of(0, 1, 2), 24000, 16000);
+    expect(out.length).toBe(2);
+    expect(out[0]).toBeCloseTo(0, 6); // window [0,1) — one sample
+    expect(out[1]).toBeCloseTo(1.5, 6); // window [1,3) — two samples
+  });
+
+  // Pins the exact boundary rule on the awkward ratio: start = floor(i*ratio),
+  // end = floor((i+1)*ratio), so every input sample lands in exactly one window
+  // (no double-counting, no gaps) even when widths alternate 2/3.
+  test('places 44.1k->16k window boundaries at floor(i*ratio) on a ramp', () => {
+    // ratio 2.75625 over a ramp 0..13: windows [0,2) [2,5) [5,8) [8,11) [11,13)
+    const out = downsample(Float32Array.from({ length: 14 }, (_, i) => i), 44100, 16000);
+    expect(out.length).toBe(5);
+    expect(out[0]).toBeCloseTo(0.5, 6); // avg(0,1)
+    expect(out[1]).toBeCloseTo(3, 6); // avg(2,3,4)
+    expect(out[2]).toBeCloseTo(6, 6); // avg(5,6,7)
+    expect(out[3]).toBeCloseTo(9, 6); // avg(8,9,10)
+    expect(out[4]).toBeCloseTo(11.5, 6); // avg(11,12)
+  });
+
   // 44.1 kHz is the other rate Windows hands us, and its ratio to 16 kHz is
   // 2.75625 — windows land on fractional boundaries and vary between 2 and 3
   // samples wide.

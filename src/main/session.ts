@@ -63,7 +63,8 @@ export function toAppError(err: unknown, fallbackCode: AppError['code'] = 'inter
 
 interface ActiveSession {
   id: number;
-  stt: SttStream;
+  /** Null for ask() sessions: the question arrived as text, nothing to record. */
+  stt: SttStream | null;
   abort: AbortController;
   stopped: boolean;
   /** Set once finalize() has handed back a transcript: STT's job is done. */
@@ -74,7 +75,7 @@ export class SessionManager {
   private deps: SessionDeps;
   private timeouts: Timeouts;
   private nextId = 1;
-  /** The most recently begun start(); an older in-flight start is superseded. */
+  /** The most recently begun start() or ask(); an older in-flight start is superseded. */
   private latestStartId = 0;
   private active: ActiveSession | null = null;
 
@@ -110,7 +111,75 @@ export class SessionManager {
 
   audio(sessionId: number, pcm: ArrayBuffer): void {
     const s = this.active;
-    if (s && s.id === sessionId && !s.stopped) s.stt.sendAudio(pcm);
+    if (s && s.id === sessionId && !s.stopped) s.stt?.sendAudio(pcm);
+  }
+
+  /**
+   * Answer a typed (or re-asked) question directly, skipping recording and STT
+   * entirely. Supersedes any active session exactly like start(). Resolves with
+   * the session id right away — the answer then streams through the same events
+   * as a recorded session: one final onSttPartial carrying the question text,
+   * onLlmDelta per token, and onLlmDone (or onError). Metrics are measured from
+   * this call, with sttFinalizeMs pinned to 0 since nothing was finalized.
+   */
+  async ask(text: string): Promise<number> {
+    // The latency clock starts the moment the user submits the question.
+    const t0 = performance.now();
+    const trimmed = text.trim();
+    // ipc validates too; stay defensive so no caller can launch an LLM run on
+    // an empty prompt. Checked before cancelActive: invalid input must not
+    // kill a session that is mid-flight.
+    if (!trimmed) {
+      throw { code: 'internal', message: 'Cannot ask an empty question.' } satisfies AppError;
+    }
+    this.cancelActive();
+    const id = this.nextId++;
+    // Claim "newest" exactly like start(): an in-flight start() that resolves
+    // later must discover it lost, and a later start()/ask() supersedes us.
+    this.latestStartId = id;
+    const s: ActiveSession = {
+      id,
+      stt: null, // the question arrived as text — nothing to record or finalize
+      abort: new AbortController(),
+      stopped: true, // there is no recording to stop; audio() must be a no-op
+      transcriptFinal: true,
+    };
+    this.active = s;
+    // Deferred a tick so the caller holds the session id before the first
+    // event lands — mirrors start(), where events can only follow resolution.
+    setImmediate(() => void this.runAsk(s, trimmed, t0));
+    return id;
+  }
+
+  private async runAsk(s: ActiveSession, transcript: string, t0: number): Promise<void> {
+    const sessionId = s.id;
+    const since = () => Math.round(performance.now() - t0);
+    let firstTokenMs: number | null = null;
+    try {
+      if (this.isStale(sessionId)) return; // cancelled/replaced before the tick fired
+      // The renderer keys everything off the recorded-session event shape, so
+      // the question goes out as an already-final transcript.
+      this.deps.events.onSttPartial(sessionId, transcript, true);
+      const llm = this.deps.createLlm();
+      const answer = await this.runLlm(s, transcript, llm, () => {
+        firstTokenMs = since();
+      });
+      if (this.isStale(sessionId)) return;
+      const totalMs = since();
+      this.deps.events.onLlmDone(sessionId, transcript, answer, {
+        sttFinalizeMs: 0, // no STT stage: reporting anything else would be a lie
+        // Same rule as runStop: a provider that never streamed a delta had no
+        // "first token" moment, and 0 would read as instant.
+        firstTokenMs: firstTokenMs ?? totalMs,
+        totalMs,
+      });
+    } catch (err) {
+      if (this.isStale(sessionId)) return;
+      const appErr = toAppError(err);
+      if (appErr.code !== 'aborted') this.deps.events.onError(sessionId, appErr);
+    } finally {
+      if (this.active?.id === sessionId) this.active = null;
+    }
   }
 
   /**
@@ -124,20 +193,22 @@ export class SessionManager {
    */
   async stop(sessionId: number): Promise<boolean> {
     const s = this.active;
-    if (!s || s.id !== sessionId || s.stopped) return false;
+    // `!s.stt` is the ask() case: there is no recording to stop. Those sessions
+    // are also created with stopped=true, but the extra check keeps the type honest.
+    if (!s || s.id !== sessionId || s.stopped || !s.stt) return false;
     s.stopped = true;
-    await this.runStop(s, sessionId);
+    await this.runStop(s, s.stt, sessionId);
     return true;
   }
 
-  private async runStop(s: ActiveSession, sessionId: number): Promise<void> {
+  private async runStop(s: ActiveSession, stt: SttStream, sessionId: number): Promise<void> {
     // The only clock that matters: the user pressed stop and is now waiting.
     const t0 = performance.now();
     const since = () => Math.round(performance.now() - t0);
     let firstTokenMs: number | null = null;
 
     try {
-      const transcript = (await s.stt.finalize(this.timeouts.sttFinalizeMs)).trim();
+      const transcript = (await stt.finalize(this.timeouts.sttFinalizeMs)).trim();
       const sttFinalizeMs = since();
       if (this.isStale(sessionId)) return;
       s.transcriptFinal = true;
@@ -185,7 +256,7 @@ export class SessionManager {
     if (!s || s.id !== sessionId || s.transcriptFinal) return;
     this.active = null;
     s.abort.abort();
-    s.stt.abort();
+    s.stt?.abort();
     this.deps.events.onError(sessionId, toAppError(err, 'stt_error'));
   }
 
@@ -201,7 +272,7 @@ export class SessionManager {
     if (!s) return;
     this.active = null;
     s.abort.abort();
-    s.stt.abort();
+    s.stt?.abort();
   }
 
   private async runLlm(

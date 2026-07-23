@@ -22,6 +22,14 @@ answer           first token streams into the panel; when it completes, the
                  measured stop-to-first-word lands in the panel header
 ```
 
+On top of that, the main process **pre-warms the LLM connection**
+(`llm/warm.ts`): a throttled, fire-and-forget request opens a pooled TCP+TLS
+connection to the active provider's origin when recording starts and again the
+instant Stop is pressed — so the TLS handshake runs concurrently with the STT
+finalize instead of inside the stop-to-first-word window. Node's fetch (undici)
+pools per origin, and both the Anthropic SDK and the Groq fetch draw from that
+pool.
+
 The pre-open buffering that makes this work lives in the **renderer**
 (`app.ts` holds frames until `session:start` resolves, then replays them).
 `DeepgramStream` also has an internal pre-open buffer, but in practice it never
@@ -43,7 +51,9 @@ Don't take the latency on faith — the UI reports the real number
   re-recording aborts the in-flight session; per-stage timeouts (5 s STT
   finalize, 10 s LLM first token, 60 s total); structured `{code, message}`
   errors; mid-stream STT failures surface as `stt_error` instead of silently
-  truncating the transcript
+  truncating the transcript; both providers retry a pre-stream connection
+  failure exactly once (never after a delta reached the panel, never on an
+  HTTP error status)
 - **Secrets**: API keys encrypted with Electron `safeStorage` (DPAPI); the
   renderer only ever sees `hasKey` flags. `settings.json` is zod-validated on
   read (per-field fallback, so one bad value can't cost you your resume) and
@@ -56,11 +66,20 @@ Don't take the latency on faith — the UI reports the real number
   `CommandOrControl+Shift+Space`, editable in Settings, empty to disable. If
   another app already owns the accelerator, registration fails and the UI says
   so rather than leaving you pressing a dead key. Ignored while Settings is open.
-- **Answer style** — brief / balanced / detailed. `balanced` is v1's wording
-  verbatim, so the default behaviour is unchanged.
+- **Ask box** — type a question and get a streamed answer without recording:
+  the fallback when call audio isn't available, and the way to ask your own
+  follow-ups. Runs through the same session pipeline (same events, same
+  timeouts, same metrics with the STT stage at 0 ms).
+- **Regenerate** — re-asks the viewed entry's question as a fresh answer (new
+  history entry), so a weak answer costs one click, not a re-record.
+- **Answer style** — brief / balanced / detailed, switchable from the main view
+  via a chip toggle (also in Settings). `balanced` is v1's wording verbatim, so
+  the default behaviour is unchanged — and a style flip is latency-free by
+  design, because the cached prompt prefix is split before the style suffix.
 - **Latency readout** — "X.Xs to first word" per answer; hover for the STT
   finalize / first token / total breakdown.
-- **History** — last 6 Q/A pairs, arrow-key-free prev/next in the panel header.
+- **History** — last 6 Q/A pairs, arrow-key-free prev/next in the panel header,
+  plus a clear button (enabled while idle).
 - **Markdown answers** — dependency-free streaming renderer. Every string
   reaches the DOM via `createTextNode`/`textContent`, never `innerHTML`; links
   are deliberately not parsed, so there's no href to sanitize. Diffs at block
@@ -104,13 +123,16 @@ Keys are stored encrypted per-machine and can be replaced but never read back.
 | Command | What it does |
 |---|---|
 | `npm start` | Build everything and launch Electron |
-| `npm test` | Vitest suite (199 tests across 8 files) |
+| `npm test` | Vitest suite (379 tests across 10 files) |
 | `npm run typecheck` | Strict TS across main + renderer |
 | `npm run dist` | Windows NSIS installer via electron-builder |
 
 Tests cover prompt building, SSE parsing, PCM helpers, Deepgram frame parsing +
-stream lifecycle, the session manager, the settings store, the LLM providers,
-and the markdown parser. No Electron and no network needed.
+stream lifecycle, the session manager (recorded and typed questions), the
+settings store, the LLM providers, the connection pre-warm, the renderer's
+display formatters, and the markdown parser + streaming DOM view. No Electron
+and no network needed. **Every test is documented in
+[docs/TESTING.md](docs/TESTING.md)** — what it verifies and why it exists.
 
 ## Layout
 
@@ -121,22 +143,27 @@ src/
     pcm.ts        pure PCM helpers (shared by tests and both processes)
   main/
     main.ts       window, loopback grant, content protection, global shortcut
-    ipc.ts        zod-validated handlers; events tagged { sessionId }
-    session.ts    one active session; new session aborts old; timeouts; metrics
+    ipc.ts        zod-validated handlers; events tagged { sessionId }; pre-warm calls
+    session.ts    one active session; new session aborts old; timeouts; metrics;
+                  ask() for typed/re-asked questions (no STT stage)
     sse.ts        OpenAI-style SSE chunk/tail parser (used by Groq)
     stt/deepgram.ts   WS client: keepalive, finalize, mid-stream error reporting
     llm/anthropic.ts  Haiku 4.5, two-block system prompt, one connection retry
-    llm/groq.ts       OpenAI-compatible SSE streaming, reasoning suppressed
+    llm/groq.ts       OpenAI-compatible SSE streaming, reasoning suppressed,
+                      one connection retry, 1024-token completion cap
+    llm/warm.ts   throttled fire-and-forget TLS pre-warm of the provider origin
     prompt.ts     system prompt split at the cache breakpoint (pure, tested)
     store.ts      zod-validated settings + safeStorage-encrypted keys; atomic write
   preload.ts      typed contextBridge with unsubscribe functions
   renderer/
     app.ts        state machine: idle → starting → recording → finalizing → answering
+    format.ts     pure display helpers: accelerator labels, timer, latency strings
     markdown.ts   markdown subset: pure parser + streaming DOM view (XSS-safe)
-    index.html    main + settings views
+    index.html    main + settings views, ask box, style chips
     styles.css    dark theme, AA-contrast palette, focus rings
     public/pcm-worklet.js  capture → downsample → Int16 frames + level meter
-test/             199 vitest tests, no Electron or network needed
+test/             379 vitest tests, no Electron or network needed
+docs/TESTING.md   every test documented: what it verifies and why it exists
 ```
 
 ## Notes

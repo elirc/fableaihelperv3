@@ -23,6 +23,12 @@ const MODEL = 'openai/gpt-oss-120b';
 // supported controls for this model family.
 const REASONING_EFFORT = 'low';
 
+// Parity with anthropic.ts's MAX_TOKENS. Spoken answers are short; an uncapped
+// runaway completion is pure tail latency (the panel keeps filling long after
+// the user has the answer they need) and burns tokens for nothing. Groq's
+// OpenAI-compatible API takes the newer `max_completion_tokens` name.
+const MAX_COMPLETION_TOKENS = 1024;
+
 export function createGroqProvider(
   apiKey: string,
   resume: string,
@@ -33,35 +39,56 @@ export function createGroqProvider(
 
   return {
     async generate(transcript, onDelta, signal) {
-      let res: Response;
-      try {
-        res = await fetch(API_URL, {
+      // Serialized once so a retry re-sends byte-identical bytes (and does not
+      // pay JSON.stringify twice) — same shape as the Anthropic provider.
+      const body = JSON.stringify({
+        model: MODEL,
+        stream: true,
+        temperature: 0.7,
+        max_completion_tokens: MAX_COMPLETION_TOKENS,
+        reasoning_effort: REASONING_EFFORT,
+        include_reasoning: false,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: buildUserMessage(transcript) },
+        ],
+      });
+      const attempt = (): Promise<Response> =>
+        fetch(API_URL, {
           method: 'POST',
           signal,
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${apiKey}`,
           },
-          body: JSON.stringify({
-            model: MODEL,
-            stream: true,
-            temperature: 0.7,
-            reasoning_effort: REASONING_EFFORT,
-            include_reasoning: false,
-            messages: [
-              { role: 'system', content: system },
-              { role: 'user', content: buildUserMessage(transcript) },
-            ],
-          }),
+          body,
         });
-      } catch (err) {
+
+      let res: Response;
+      try {
+        res = await attempt();
+      } catch {
         // fetch rejects with an AbortError when the session cancels us. That is
         // not a failure the user should ever see.
         if (signal.aborted) throw abortedError();
-        throw {
-          code: 'llm_http',
-          message: 'Could not reach Groq. Check your internet connection.',
-        } satisfies AppError;
+        // Retry parity with the Anthropic provider: a rejected fetch means the
+        // request never landed — no HTTP status, no bytes on screen — so one
+        // immediate retry is strictly better than an error mid-interview.
+        // This is deliberately scoped to the *initial* fetch: HTTP error
+        // statuses (401/429/5xx) resolve rather than reject and are never
+        // retried (the server heard us and said no — an instant retry just
+        // burns the first-token budget), and a mid-stream drop is handled
+        // below without a retry (the renderer appends deltas, so a second
+        // attempt would concatenate two answers).
+        try {
+          res = await attempt();
+        } catch {
+          if (signal.aborted) throw abortedError();
+          throw {
+            code: 'llm_http',
+            message: 'Could not reach Groq. Check your internet connection.',
+          } satisfies AppError;
+        }
       }
 
       if (!res.ok) {
@@ -123,7 +150,9 @@ function abortedError(): AppError {
 
 function httpError(status: number, body: string): AppError {
   if (status === 401 || status === 403) {
-    return { code: 'llm_auth', message: 'Groq rejected the API key (401). Check it in Settings.' };
+    // Both are key problems, but report the status we actually got — a 403
+    // labelled "(401)" sends the user debugging the wrong thing.
+    return { code: 'llm_auth', message: `Groq rejected the API key (HTTP ${status}). Check it in Settings.` };
   }
   if (status === 429) {
     return {

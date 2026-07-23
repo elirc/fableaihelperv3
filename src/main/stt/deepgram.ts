@@ -10,6 +10,12 @@ import type { SttStream } from '../session';
 // header (`['token', key]`), which is the only auth the browser-style
 // WebSocket API can carry.
 
+// Latency note: `endpointing` and `no_delay` are deliberately absent. The
+// stop-to-first-word path never waits on Deepgram's endpointer — Stop sends
+// CloseStream, which makes the server flush whatever it is still holding
+// (including smart_format's entity hold-back) and close. Tuning endpointing
+// would only shift when interims get promoted to finals mid-speech, and
+// no_delay trades smart_format quality for a wait this client never does.
 const DEEPGRAM_URL =
   'wss://api.deepgram.com/v1/listen' +
   '?model=nova-3&encoding=linear16&sample_rate=16000&channels=1' +
@@ -188,7 +194,11 @@ export class DeepgramStream implements SttStream {
   }
 
   sendAudio(pcm: ArrayBuffer): void {
-    if (this.closed) return;
+    // closeRequested covers the finalize window: once CloseStream is out the
+    // socket is CLOSING, so a straggler capture frame can no longer influence
+    // the transcript — and a send failure on it would report a bogus
+    // mid-recording error for a stop that is actually succeeding.
+    if (this.closed || this.closeRequested) return;
     if (!this.open) {
       this.buffer(pcm);
       return;
@@ -224,6 +234,11 @@ export class DeepgramStream implements SttStream {
     // Already closed, aborted, or failed: nothing left to flush.
     if (this.closed) return this.fullTranscript();
     this.closeRequested = true;
+    // Stop pinging the moment we ask for the close: a KeepAlive after
+    // CloseStream is at best ignored, and if the flush wait crosses the next
+    // 8 s tick on a socket that is already CLOSING, the failed send would
+    // surface a spurious "lost connection" error mid-stop.
+    this.stopKeepalive();
 
     // Never reached OPEN, or the socket is already gone: there is nothing to
     // flush and nobody to answer, so waiting would just burn the whole timeout
@@ -265,6 +280,13 @@ export class DeepgramStream implements SttStream {
   }
 
   private handleMessage(ev: MessageEvent): void {
+    // After teardown the transcript is spoken for — finalize() has already
+    // resolved with it (or the stream died and reported why). A late frame
+    // must not fire partials or grow the finals past what was returned, or the
+    // on-screen transcript would contradict the answer generated from it.
+    // Note this is `closed`, not `closeRequested`: the tail flush between
+    // CloseStream and the server close must still count.
+    if (this.closed) return;
     if (typeof ev.data !== 'string') return;
     const frame = parseDeepgramFrame(ev.data);
     if (!frame) return;
@@ -284,6 +306,10 @@ export class DeepgramStream implements SttStream {
   }
 
   private handleSocketError(): void {
+    // A socket error after teardown is stale news — we already dropped the
+    // socket (finalize settled, abort, or a reported failure), so a TCP reset
+    // trickling in afterwards is not a new mid-recording failure.
+    if (this.closed) return;
     this.emitError('The connection to Deepgram failed mid-recording.');
   }
 
@@ -325,13 +351,17 @@ export class DeepgramStream implements SttStream {
     }
   }
 
-  private teardown(): void {
-    this.closed = true;
-    this.open = false;
+  private stopKeepalive(): void {
     if (this.keepalive) {
       clearInterval(this.keepalive);
       this.keepalive = null;
     }
+  }
+
+  private teardown(): void {
+    this.closed = true;
+    this.open = false;
+    this.stopKeepalive();
     this.pending = [];
     this.pendingBytes = 0;
     // The stream is over; nothing else will ever arrive, so release finalize()

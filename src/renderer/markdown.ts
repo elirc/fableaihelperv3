@@ -36,7 +36,9 @@ const ESCAPABLE = '\\`*_{}[]()#+-.!>~';
 
 const UL_RE = /^[ \t]*[-*+][ \t]+(.*)$/;
 const OL_RE = /^[ \t]*(\d{1,9})[.)][ \t]+(.*)$/;
-const HEADING_RE = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
+// A closing hash run is only decorative when preceded by whitespace, so
+// "## Tips ##" strips to "Tips" but "### Experience with C#" keeps its "#".
+const HEADING_RE = /^ {0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$/;
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
 const HR_RE = /^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 
@@ -71,6 +73,13 @@ function findClose(src: string, from: number, delim: string, c: string): number 
     }
     if (delim.length === 1 && src.charAt(at + 1) === c) {
       j = at + 1; // part of a longer run, e.g. the `**` inside `*a**`
+      continue;
+    }
+    if (delim.length === 1 && src.charAt(at - 1) === c && src.charAt(at - 2) !== '\\') {
+      // Also part of a longer run, seen from its far end: without this, the
+      // second `*` of the `**` in `*a **b** c*` closed the emphasis early.
+      // (An escaped `\*` before the candidate is literal text, not a run.)
+      j = at + delim.length;
       continue;
     }
     if (c === '_' && isWord(src.charAt(at + delim.length))) {
@@ -118,7 +127,22 @@ export function parseInline(src: string): Inline[] {
       let run = 1;
       while (src.charAt(i + run) === '`') run += 1;
       const fence = '`'.repeat(run);
-      const close = src.indexOf(fence, i + run);
+      // CommonMark: the closing run must be *exactly* as long as the opener,
+      // so `` ` `` closes against the final lone backtick in "` `` `", not the
+      // first backtick of the longer inner run.
+      let close = -1;
+      let k = i + run;
+      while (k < src.length) {
+        const at = src.indexOf(fence, k);
+        if (at === -1) break;
+        let len = run;
+        while (src.charAt(at + len) === '`') len += 1;
+        if (len === run) {
+          close = at;
+          break;
+        }
+        k = at + len; // skip the whole longer run
+      }
       if (close !== -1) {
         flush();
         out.push({ type: 'code', value: stripCodePadding(src.slice(i + run, close)) });

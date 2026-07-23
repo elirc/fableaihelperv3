@@ -22,6 +22,7 @@ const api: RendererApi = {
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (patch) => ipcRenderer.invoke('settings:set', patch),
   startSession: () => ipcRenderer.invoke('session:start'),
+  askQuestion: (text) => ipcRenderer.invoke('session:ask', text),
   sendAudio: (sessionId, pcm) => ipcRenderer.send('audio:chunk', sessionId, pcm),
   stopSession: (sessionId) => ipcRenderer.invoke('session:stop', sessionId),
   cancelSession: (sessionId) => ipcRenderer.invoke('session:cancel', sessionId),
