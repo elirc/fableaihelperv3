@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'" />
-  <title>AI Call Assistant</title>
+  <title>Interview Practice Partner</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <header>
     <div class="brand">
       <span class="dot" id="statusDot" aria-hidden="true"></span>
-      <h1>AI Call Assistant</h1>
+      <h1>Interview Practice Partner</h1>
     </div>
     <button id="settingsBtn" class="icon-btn" type="button" aria-label="Settings" title="Settings">
       <span aria-hidden="true">&#9881;</span>
@@ -18,7 +18,7 @@
   </header>
 
   <main id="mainView">
-    <div class="status" id="statusText" role="status">Ready — press Record while the other person is speaking</div>
+    <div class="status" id="statusText" role="status">Ready — press Record while your practice partner asks a question</div>
 
     <button id="recordBtn" class="record-btn" type="button">
       <span class="rec-icon" aria-hidden="true"></span>
@@ -35,7 +35,7 @@
 
     <form id="askForm" class="ask-row">
       <label class="sr-only" for="askInput">Type a question</label>
-      <input type="text" id="askInput" placeholder="Or type the question here…" autocomplete="off" spellcheck="false" />
+      <input type="text" id="askInput" placeholder="Or type a practice question here…" autocomplete="off" spellcheck="false" />
       <button id="askBtn" class="ask-btn" type="submit">Ask</button>
     </form>
 
@@ -62,15 +62,16 @@
 
     <section class="panel grow" aria-labelledby="answerTitle">
       <div class="panel-title">
-        <span id="answerTitle">Suggested answer</span>
+        <span id="answerTitle">Model answer</span>
         <span class="gen-tag" id="genTag" hidden>generating…</span>
         <span class="latency" id="latencyTag" hidden></span>
+        <span class="latency" id="costTag" hidden></span>
         <div class="title-actions">
           <button id="regenBtn" class="mini-btn" type="button" aria-label="Regenerate answer" hidden><span aria-hidden="true">&#8635;</span> Regenerate</button>
           <button id="copyBtn" class="mini-btn" type="button" aria-label="Copy answer" hidden><span id="copyLabel">Copy</span></button>
         </div>
       </div>
-      <div class="panel-body md" id="answerBox" aria-live="polite" aria-atomic="false" tabindex="0"><span class="placeholder">Your AI-suggested answer will stream here.</span></div>
+      <div class="panel-body md" id="answerBox" aria-live="polite" aria-atomic="false" tabindex="0"><span class="placeholder">The model answer to practise against will stream here.</span></div>
     </section>
 
     <div class="error" id="errorBox" role="alert" hidden></div>
@@ -84,16 +85,36 @@
     <label for="deepgramKey">Deepgram API key <span class="hint">(live transcription) — <a href="https://console.deepgram.com/" target="_blank" rel="noreferrer">get one</a></span></label>
     <input type="password" id="deepgramKey" autocomplete="off" />
 
-    <label for="llmProvider">Answer model</label>
+    <label for="audioSource">Question audio source</label>
+    <select id="audioSource">
+      <option value="microphone">Microphone — a partner asking questions in the room</option>
+      <option value="system">System audio — sound this PC is playing (call, video, recording)</option>
+    </select>
+
+    <label for="llmProvider">Answer provider</label>
     <select id="llmProvider">
-      <option value="anthropic">Claude Haiku 4.5 (recommended)</option>
-      <option value="groq">Groq GPT-OSS 120B (fastest)</option>
+      <option value="anthropic">Anthropic Claude (recommended)</option>
+      <option value="groq">Groq (fastest)</option>
+    </select>
+
+    <label for="anthropicModel">Claude model <span class="hint">(latency/cost trade — the cost chip shows the real numbers)</span></label>
+    <select id="anthropicModel">
+      <option value="claude-haiku-4-5">Haiku 4.5 — fastest, $1/$5 per MTok (default)</option>
+      <option value="claude-sonnet-5">Sonnet 5 — stronger writing, $3/$15 per MTok</option>
+      <option value="claude-opus-5">Opus 5 — strongest, $5/$25 per MTok</option>
+    </select>
+
+    <label for="groqModel">Groq model <span class="hint">(pricing not pinned — the chip shows tokens)</span></label>
+    <select id="groqModel">
+      <option value="openai/gpt-oss-120b">GPT-OSS 120B — default, ~500 tok/s</option>
+      <option value="openai/gpt-oss-20b">GPT-OSS 20B — smaller, faster</option>
+      <option value="llama-3.1-8b-instant">Llama 3.1 8B Instant — cheapest</option>
     </select>
 
     <label for="anthropicKey">Anthropic API key <span class="hint"><a href="https://platform.claude.com/" target="_blank" rel="noreferrer">get one</a></span></label>
     <input type="password" id="anthropicKey" autocomplete="off" />
 
-    <label for="groqKey">Groq API key <span class="hint">(only for the Groq preset) — <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer">get one</a></span></label>
+    <label for="groqKey">Groq API key <span class="hint">(only for the Groq provider) — <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer">get one</a></span></label>
     <input type="password" id="groqKey" autocomplete="off" />
 
     <label for="answerStyle">Answer style</label>
@@ -113,15 +134,15 @@
     <label for="resume">Your resume <span class="hint">(paste as plain text)</span></label>
     <textarea id="resume" rows="7" placeholder="Paste your resume here so answers match your background..."></textarea>
 
-    <label for="jobDescription">Job description <span class="hint">(the role you're interviewing for)</span></label>
+    <label for="jobDescription">Job description <span class="hint">(the role you're practising for)</span></label>
     <textarea id="jobDescription" rows="6" placeholder="Paste the job description here..."></textarea>
 
     <label class="check" for="alwaysOnTop">
       <input type="checkbox" id="alwaysOnTop" />
-      Keep window on top of the call app
+      Keep window on top of other apps
     </label>
 
-    <p class="hint">API keys are stored encrypted on this machine and never shown again here. This window is always hidden from screen sharing and recordings.</p>
+    <p class="hint">API keys are stored encrypted on this machine and never shown again here.</p>
 
     <div class="row">
       <button id="saveBtn" class="primary" type="button">Save</button>

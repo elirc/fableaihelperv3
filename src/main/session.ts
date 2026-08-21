@@ -1,5 +1,5 @@
 import { performance } from 'node:perf_hooks';
-import type { AnswerMetrics, AppError } from '../shared/types';
+import type { AnswerMetrics, AnswerUsage, AppError } from '../shared/types';
 
 // One live question/answer pipeline. The manager owns exactly one active
 // session; starting a new one aborts the old, which is what makes
@@ -22,7 +22,17 @@ export interface SttStream {
 }
 
 export interface LlmProvider {
-  generate(transcript: string, onDelta: (delta: string) => void, signal: AbortSignal): Promise<string>;
+  /**
+   * Stream an answer. `onUsage`, when provided, receives the provider-reported
+   * token usage (and cost estimate) once known — optional so test doubles and
+   * providers that report nothing stay valid with the plain 3-arg shape.
+   */
+  generate(
+    transcript: string,
+    onDelta: (delta: string) => void,
+    signal: AbortSignal,
+    onUsage?: (usage: AnswerUsage) => void,
+  ): Promise<string>;
 }
 
 export interface SessionEvents {
@@ -161,7 +171,7 @@ export class SessionManager {
       // the question goes out as an already-final transcript.
       this.deps.events.onSttPartial(sessionId, transcript, true);
       const llm = this.deps.createLlm();
-      const answer = await this.runLlm(s, transcript, llm, () => {
+      const { answer, usage } = await this.runLlm(s, transcript, llm, () => {
         firstTokenMs = since();
       });
       if (this.isStale(sessionId)) return;
@@ -172,6 +182,9 @@ export class SessionManager {
         // "first token" moment, and 0 would read as instant.
         firstTokenMs: firstTokenMs ?? totalMs,
         totalMs,
+        // Spread, not `usage,`: providers that report nothing must not add a
+        // `usage: undefined` key that breaks exact-equality assertions.
+        ...(usage ? { usage } : {}),
       });
     } catch (err) {
       if (this.isStale(sessionId)) return;
@@ -215,13 +228,14 @@ export class SessionManager {
       if (!transcript) {
         throw {
           code: 'no_speech',
-          message: 'No speech detected in the recording. Make sure call audio is playing.',
+          message:
+            'No speech detected in the recording. Check the audio source in Settings — microphone for a partner in the room, system audio for sound this PC is playing.',
         } satisfies AppError;
       }
       this.deps.events.onSttPartial(sessionId, transcript, true);
 
       const llm = this.deps.createLlm();
-      const answer = await this.runLlm(s, transcript, llm, () => {
+      const { answer, usage } = await this.runLlm(s, transcript, llm, () => {
         firstTokenMs = since();
       });
       if (this.isStale(sessionId)) return;
@@ -232,6 +246,7 @@ export class SessionManager {
         // delta had no "first token" moment; reporting 0 would read as instant.
         firstTokenMs: firstTokenMs ?? totalMs,
         totalMs,
+        ...(usage ? { usage } : {}),
       });
     } catch (err) {
       if (this.isStale(sessionId)) return;
@@ -280,11 +295,15 @@ export class SessionManager {
     transcript: string,
     llm: LlmProvider,
     onFirstToken: () => void,
-  ): Promise<string> {
+  ): Promise<{ answer: string; usage?: AnswerUsage }> {
     const { signal } = s.abort;
     let gotFirstToken = false;
+    // Captured from the provider's onUsage callback rather than returned by
+    // generate(): keeping generate() -> string means every existing provider
+    // and test double stays valid unchanged.
+    let usage: AnswerUsage | undefined;
 
-    return await new Promise<string>((resolve, reject) => {
+    return await new Promise<{ answer: string; usage?: AnswerUsage }>((resolve, reject) => {
       const firstTokenTimer = setTimeout(() => {
         if (!gotFirstToken) {
           fail({ code: 'llm_first_token_timeout', message: 'The answer model did not start responding in time.' });
@@ -318,12 +337,15 @@ export class SessionManager {
             if (!settled && this.active?.id === s.id) this.deps.events.onLlmDelta(s.id, delta);
           },
           signal,
+          (u) => {
+            usage = u;
+          },
         )
         .then((full) => {
           if (settled) return;
           settled = true;
           cleanup();
-          resolve(full);
+          resolve({ answer: full, usage });
         })
         .catch((err) => {
           if (signal.aborted) fail({ code: 'aborted', message: 'cancelled' });

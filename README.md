@@ -1,106 +1,104 @@
-# AI Call Assistant v2
+# Interview Practice Partner
 
-Push-to-record interview copilot for Windows. Captures system audio (the other
-person's voice on a call), streams it to a live transcript **while they are
-still speaking**, and starts streaming an AI-suggested answer within about a
-second of pressing Stop.
+Mock-interview practice tool for Windows. A practice partner (a friend, your
+spouse, a recorded question list) asks you an interview question out loud; the
+app transcribes it **while they are still speaking** and, about a second after
+you press Stop, streams the **model answer** — the answer a strong, well-prepared
+candidate would give, grounded in your resume and target job description. You
+study it, learn the key beats, and practise saying it in your own words.
 
-This is the v2 rewrite of `Desktop/aihelper`: same interaction model and
-Windows loopback/screen-hide moat, new pipeline built for latency.
+This is the practice-mode rework of the v2 low-latency pipeline: same
+sub-second engineering, pointed at rehearsal. Each answer ends with a
+**Key beats** section — the two to four points worth memorising — because the
+prose is what good sounds like, and the beats are what you actually keep.
 
-## How it gets fast
+## How a practice round works
 
 ```
-record pressed   session:start (Deepgram WS) and getDisplayMedia spin up in
-                 PARALLEL; audio frames captured before the session resolves are
-                 held in the renderer (cap ~15 s) and flushed the moment it does
-while recording  AudioWorklet → 16 kHz Int16 → ~128 ms frames → Deepgram;
-                 partial transcript renders live, is_final marks committed text
-stop pressed     the latency clock starts here. CloseStream flushes the tail
-                 (5 s cap) → LLM request fires immediately, cached prefix intact
-answer           first token streams into the panel; when it completes, the
-                 measured stop-to-first-word lands in the panel header
+partner asks     press Record; the question transcribes live while they speak
+                 (default source: microphone; switchable to system audio to
+                 practise against a video call or a played question list)
+stop pressed     the latency clock starts. STT finalizes (5 s cap) → the LLM
+                 request fires immediately, cached prefix intact
+model answer     streams into the panel; the header shows the measured
+                 stop-to-first-word latency AND the estimated cost of the answer
+you practise     read it, close it, answer the same question out loud yourself;
+                 press Regenerate to see a fresh take, or ask a follow-up in
+                 the Ask box
 ```
 
-On top of that, the main process **pre-warms the LLM connection**
-(`llm/warm.ts`): a throttled, fire-and-forget request opens a pooled TCP+TLS
-connection to the active provider's origin when recording starts and again the
-instant Stop is pressed — so the TLS handshake runs concurrently with the STT
-finalize instead of inside the stop-to-first-word window. Node's fetch (undici)
-pools per origin, and both the Anthropic SDK and the Groq fetch draw from that
-pool.
+## Comparing models (latency + cost)
 
-The pre-open buffering that makes this work lives in the **renderer**
-(`app.ts` holds frames until `session:start` resolves, then replays them).
-`DeepgramStream` also has an internal pre-open buffer, but in practice it never
-fills: the session only sends audio after `connect()` resolves, and `connect()`
-resolves on socket open. Treat that one as defence, not as the mechanism.
+Settings offers a curated model picker per provider, and every answer carries
+two chips:
 
-Don't take the latency on faith — the UI reports the real number
-(`AnswerMetrics`, measured in main from the moment Stop is pressed).
+- **latency** — "X.Xs to first word", measured in the main process from the
+  moment Stop is pressed; hover for the STT-finalize / first-token / total
+  breakdown.
+- **cost** — an estimated dollar figure for Anthropic models (pricing pinned in
+  `src/main/llm/pricing.ts`, verified 2026-08-20), or a raw `in→out tok` count
+  for Groq, whose pricing is deliberately not pinned here. Hover for the model
+  name and full token accounting, including prompt-cache reads/writes.
+
+| Provider | Models | Notes |
+|---|---|---|
+| Anthropic | Haiku 4.5 ($1/$5 per MTok, default) · Sonnet 5 ($3/$15) · Opus 5 ($5/$25) | Sonnet/Opus think by default; the app disables thinking for them so the first token isn't spent reasoning |
+| Groq | GPT-OSS 120B (default) · GPT-OSS 20B · Llama 3.1 8B Instant | Reasoning suppressed on the gpt-oss family; cost chip shows tokens only |
+
+Ask the same question across a few models and the chips give you the real
+latency/cost/quality trade — measured, not guessed.
 
 ## Stack
 
 - **Electron 43 + strict TypeScript + Vite** (renderer) / tsc (main, preload)
 - **STT**: Deepgram Nova-3 streaming (WebSocket, linear16 @ 16 kHz)
-- **LLM**: Claude Haiku 4.5 (`claude-haiku-4-5`, official SDK, prompt caching on
-  the resume+JD block) — or a Groq `openai/gpt-oss-120b` "fastest" preset, with
-  `reasoning_effort: 'low'` + `include_reasoning: false` so a reasoning model
-  doesn't spend your first-token budget thinking
+- **LLM**: Anthropic (official SDK, prompt caching on the resume+JD block) or
+  Groq (OpenAI-compatible SSE); model picked in Settings
+- **Latency**: pre-warmed TLS connections to the provider origin
+  (`llm/warm.ts`), renderer-side frame buffering while the STT session opens,
+  prompt-cache breakpoint placed so style flips never invalidate the cached
+  resume+JD
 - **Reliability**: one active session at a time; session IDs tag every event;
   re-recording aborts the in-flight session; per-stage timeouts (5 s STT
   finalize, 10 s LLM first token, 60 s total); structured `{code, message}`
-  errors; mid-stream STT failures surface as `stt_error` instead of silently
-  truncating the transcript; both providers retry a pre-stream connection
-  failure exactly once (never after a delta reached the panel, never on an
-  HTTP error status)
+  errors; both providers retry a pre-stream connection failure exactly once
+  (never after a delta reached the panel, never on an HTTP error status)
 - **Secrets**: API keys encrypted with Electron `safeStorage` (DPAPI); the
   renderer only ever sees `hasKey` flags. `settings.json` is zod-validated on
   read (per-field fallback, so one bad value can't cost you your resume) and
   written atomically via write-then-rename
-- Window is `setContentProtection(true)` — invisible to screen shares.
 
 ### In the window
 
+- **Audio source** — microphone (default: a partner asking questions in the
+  room) or system audio (practise against a call, a video, or a recorded
+  question list). Echo cancellation stays on for the mic path so the app's own
+  playback doesn't leak into the question.
 - **Global hotkey** toggles record/stop from any app. Default
-  `CommandOrControl+Shift+Space`, editable in Settings, empty to disable. If
-  another app already owns the accelerator, registration fails and the UI says
-  so rather than leaving you pressing a dead key. Ignored while Settings is open.
-- **Ask box** — type a question and get a streamed answer without recording:
-  the fallback when call audio isn't available, and the way to ask your own
-  follow-ups. Runs through the same session pipeline (same events, same
-  timeouts, same metrics with the STT stage at 0 ms).
-- **Regenerate** — re-asks the viewed entry's question as a fresh answer (new
-  history entry), so a weak answer costs one click, not a re-record.
+  `CommandOrControl+Shift+Space`, editable in Settings, empty to disable.
+- **Ask box** — type a question and get a streamed model answer without
+  recording: same pipeline, same metrics, STT stage at 0 ms.
+- **Regenerate** — re-asks the viewed question as a fresh answer (new history
+  entry), so comparing two models on the same question costs two clicks:
+  switch model in Settings, press Regenerate.
 - **Answer style** — brief / balanced / detailed, switchable from the main view
-  via a chip toggle (also in Settings). `balanced` is v1's wording verbatim, so
-  the default behaviour is unchanged — and a style flip is latency-free by
-  design, because the cached prompt prefix is split before the style suffix.
-- **Latency readout** — "X.Xs to first word" per answer; hover for the STT
-  finalize / first token / total breakdown.
-- **History** — last 6 Q/A pairs, arrow-key-free prev/next in the panel header,
-  plus a clear button (enabled while idle).
-- **Markdown answers** — dependency-free streaming renderer. Every string
-  reaches the DOM via `createTextNode`/`textContent`, never `innerHTML`; links
-  are deliberately not parsed, so there's no href to sanitize. Diffs at block
-  level, so completed paragraphs keep their nodes (no flicker, no lost
-  selection). Page CSP is `default-src 'self'; style-src 'self'`.
-- **Accessibility** — `aria-live` on the answer panel (announced on completion,
-  not per token), `role="alert"` errors, focus moved into and back out of
-  Settings, Escape to close, visible focus rings, `prefers-reduced-motion`.
-  Palette is picked for AA contrast on the dark theme — there's a dedicated
-  `--accent-bright` token because the base accent only hit ~3:1 on dark fills.
+  via chips. A style flip is latency-free by design: the cached prompt prefix
+  is split before the style suffix.
+- **History** — last 6 Q/A pairs with prev/next and a clear button, so a
+  cross-model comparison stays on screen.
+- **Markdown answers** — dependency-free streaming renderer; every string
+  reaches the DOM via `createTextNode`/`textContent`, never `innerHTML`. Page
+  CSP is `default-src 'self'; style-src 'self'`.
+- **Accessibility** — `aria-live` answer panel, `role="alert"` errors, focus
+  management in Settings, visible focus rings, `prefers-reduced-motion`,
+  AA-contrast palette.
 
 ### Cost
 
-The LLM side is pennies. Haiku 4.5 is $1/$5 per MTok, and an answer is roughly
-1–2K tokens of profile in plus a few hundred out — call it **~$0.002–0.003 per
-answer**, so ~20 answers is around **$0.05**. Approximate: it scales with how
-long your resume and JD are.
-
-The bill is dominated by Deepgram's per-minute streaming rate for however long
-you hold the record button. That rate isn't pinned here — check their current
-pricing. Groq's pricing for `openai/gpt-oss-120b` isn't pinned here either.
+The LLM side is pennies on Haiku (~$0.002–0.003 per answer; the cost chip shows
+the real number), more on Sonnet/Opus — that's the point of the picker. The
+bill is otherwise dominated by Deepgram's per-minute streaming rate for however
+long you hold Record. That rate isn't pinned here — check their pricing.
 
 ## Setup
 
@@ -113,79 +111,77 @@ First run: open Settings (gear icon) and add
 
 1. a **Deepgram** API key (console.deepgram.com — free credit tier),
 2. an **Anthropic** API key (platform.claude.com) — or a Groq key if you pick
-   the Groq preset,
+   the Groq provider,
 3. your resume and the job description (plain text).
 
 Keys are stored encrypted per-machine and can be replaced but never read back.
+Windows will ask for microphone permission on the first recording.
 
 ## Scripts
 
 | Command | What it does |
 |---|---|
 | `npm start` | Build everything and launch Electron |
-| `npm test` | Vitest suite (379 tests across 10 files) |
+| `npm test` | Vitest suite (see `docs/TESTING.md`) |
 | `npm run typecheck` | Strict TS across main + renderer |
 | `npm run dist` | Windows NSIS installer via electron-builder |
-
-Tests cover prompt building, SSE parsing, PCM helpers, Deepgram frame parsing +
-stream lifecycle, the session manager (recorded and typed questions), the
-settings store, the LLM providers, the connection pre-warm, the renderer's
-display formatters, and the markdown parser + streaming DOM view. No Electron
-and no network needed. **Every test is documented in
-[docs/TESTING.md](docs/TESTING.md)** — what it verifies and why it exists.
 
 ## Layout
 
 ```
 src/
   shared/
-    types.ts      IPC contract, error codes, AnswerMetrics, DEFAULT_HOTKEY
+    types.ts      IPC contract, error codes, AnswerMetrics/AnswerUsage,
+                  curated model lists, audio source type
     pcm.ts        pure PCM helpers (shared by tests and both processes)
   main/
-    main.ts       window, loopback grant, content protection, global shortcut
+    main.ts       window, loopback grant (system-audio source), global shortcut
     ipc.ts        zod-validated handlers; events tagged { sessionId }; pre-warm calls
-    session.ts    one active session; new session aborts old; timeouts; metrics;
+    session.ts    one active session; timeouts; metrics incl. usage;
                   ask() for typed/re-asked questions (no STT stage)
-    sse.ts        OpenAI-style SSE chunk/tail parser (used by Groq)
+    sse.ts        OpenAI-style SSE chunk/tail parser + usage extraction (Groq)
     stt/deepgram.ts   WS client: keepalive, finalize, mid-stream error reporting
-    llm/anthropic.ts  Haiku 4.5, two-block system prompt, one connection retry
-    llm/groq.ts       OpenAI-compatible SSE streaming, reasoning suppressed,
-                      one connection retry, 1024-token completion cap
+    llm/anthropic.ts  model from Settings, two-block cached system prompt,
+                      usage + cost reporting, thinking disabled on Sonnet/Opus
+    llm/groq.ts       OpenAI-compatible SSE streaming, usage accounting,
+                      reasoning suppressed on gpt-oss, 1024-token cap
+    llm/pricing.ts    pinned Anthropic pricing + cost estimator (never guesses)
     llm/warm.ts   throttled fire-and-forget TLS pre-warm of the provider origin
-    prompt.ts     system prompt split at the cache breakpoint (pure, tested)
+    prompt.ts     mock-interview coach prompt, split at the cache breakpoint
     store.ts      zod-validated settings + safeStorage-encrypted keys; atomic write
   preload.ts      typed contextBridge with unsubscribe functions
   renderer/
-    app.ts        state machine: idle → starting → recording → finalizing → answering
-    format.ts     pure display helpers: accelerator labels, timer, latency strings
+    app.ts        state machine: idle → starting → recording → finalizing → answering;
+                  mic/system capture switch
+    format.ts     pure display helpers: latency, cost/token chips, timer
     markdown.ts   markdown subset: pure parser + streaming DOM view (XSS-safe)
-    index.html    main + settings views, ask box, style chips
+    index.html    main + settings views, ask box, style chips, model pickers
     styles.css    dark theme, AA-contrast palette, focus rings
     public/pcm-worklet.js  capture → downsample → Int16 frames + level meter
-test/             379 vitest tests, no Electron or network needed
-docs/TESTING.md   every test documented: what it verifies and why it exists
+test/             vitest suite, no Electron or network needed
+docs/TESTING.md   test documentation
 ```
 
 ## Notes
 
 - **Prompt caching, honestly.** The system prompt is two blocks with the cache
-  breakpoint after resume+JD; the answer-style policy sits *after* it. Caching is
-  a prefix match, so that split is what lets you toggle brief/balanced/detailed
-  without throwing away the cached resume and paying a full uncached prefill on
-  the next answer.
-
-  It only pays once the profile is big enough. Haiku 4.5's minimum cacheable
-  prefix is **4096 tokens**, and a typical 1–2K-token resume+JD never reaches it
-  — the marker is a silent no-op: no error, nothing cached, full price. Past
-  roughly 16K characters of profile it engages, and then writes cost 1.25x and
-  reads 0.1x, so it breaks even on the **second question** and every question
-  after that is cheaper *and* faster to first token. Cache entries have a
-  5-minute TTL, so a long gap between questions pays a fresh write. Read
-  `usage.cache_read_input_tokens` to check whether it's actually engaging.
-- The Groq model is pinned in `src/main/llm/groq.ts`. It was
-  `llama-3.3-70b-versatile`, which Groq announced as deprecated on 2026-06-17
-  with a hard shutdown on 2026-08-16; `openai/gpt-oss-120b` is Groq's own
-  recommended replacement. A 404 from Groq surfaces as "update MODEL in
-  llm/groq.ts", because that's the likely cause.
+  breakpoint after resume+JD; the answer-style policy sits *after* it. Caching
+  is a prefix match, so that split lets you toggle brief/balanced/detailed
+  without invalidating the cached resume+JD. The minimum cacheable prefix is
+  **per model**: 4096 tokens on Haiku 4.5, 1024 on Sonnet 5, 512 on Opus 5. A
+  typical 1–2K-token profile therefore silently doesn't cache on the Haiku
+  default (it starts engaging around 16K+ characters of profile) but **does
+  cache on Sonnet 5 and Opus 5** — expect their chips to show `cached read`
+  tokens from the second question onward. Cache entries have a 5-minute TTL; a
+  long gap between questions pays a fresh write.
+- **Model pricing** is pinned in `src/main/llm/pricing.ts` with a
+  verified-on date. When prices change, update that file — the UI shows
+  whatever it computes, and a stale table means stale chips. Groq deliberately
+  has no entry: tokens are shown instead of a guessed dollar figure.
+- **Practice-tool posture.** v1 hid the window from screen capture
+  (`setContentProtection`) for covert use on live calls. That's gone: this is
+  a rehearsal tool, and being capturable means you can record your practice
+  sessions. The `productName` (and therefore the settings directory) is
+  unchanged so existing keys and profiles survive the upgrade.
 - The audio worklet duplicates the small downsample/int16 helpers from
   `src/shared/pcm.ts` (worklets can't import bundled code). Keep them in sync.

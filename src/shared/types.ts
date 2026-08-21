@@ -6,6 +6,27 @@ export type LlmProviderId = 'anthropic' | 'groq';
 /** How long an answer should be. Feeds the system prompt; does not change the cached prefix shape. */
 export type AnswerStyle = 'brief' | 'balanced' | 'detailed';
 
+/**
+ * Where the practice question's audio comes from.
+ *  - 'microphone': a practice partner asking questions in the room (default).
+ *  - 'system': loopback capture of whatever this PC is playing — for
+ *    practising against a video call, a recorded question list, or a YouTube
+ *    mock interview.
+ */
+export type AudioSource = 'microphone' | 'system';
+
+// The models offered in Settings, per provider. Curated rather than free-text:
+// the point is a small honest latency/cost comparison, not a model browser.
+// Pricing for the Anthropic entries is pinned in main/llm/pricing.ts — keep the
+// two lists in sync when editing either.
+export const ANTHROPIC_MODELS = ['claude-haiku-4-5', 'claude-sonnet-5', 'claude-opus-5'] as const;
+export type AnthropicModelId = (typeof ANTHROPIC_MODELS)[number];
+export const DEFAULT_ANTHROPIC_MODEL: AnthropicModelId = 'claude-haiku-4-5';
+
+export const GROQ_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant'] as const;
+export type GroqModelId = (typeof GROQ_MODELS)[number];
+export const DEFAULT_GROQ_MODEL: GroqModelId = 'openai/gpt-oss-120b';
+
 /** Default global shortcut that toggles recording while the call app has focus. */
 export const DEFAULT_HOTKEY = 'CommandOrControl+Shift+Space';
 
@@ -15,6 +36,9 @@ export interface SettingsView {
   jobDescription: string;
   alwaysOnTop: boolean;
   llmProvider: LlmProviderId;
+  anthropicModel: AnthropicModelId;
+  groqModel: GroqModelId;
+  audioSource: AudioSource;
   answerStyle: AnswerStyle;
   /** Electron accelerator string; empty disables the global shortcut. */
   hotkey: string;
@@ -31,6 +55,9 @@ export interface SettingsPatch {
   jobDescription?: string;
   alwaysOnTop?: boolean;
   llmProvider?: LlmProviderId;
+  anthropicModel?: AnthropicModelId;
+  groqModel?: GroqModelId;
+  audioSource?: AudioSource;
   answerStyle?: AnswerStyle;
   hotkey?: string;
   deepgramKey?: string;
@@ -60,6 +87,23 @@ export interface AppError {
 
 export type Result<T> = { ok: true; value: T } | { ok: false; error: AppError };
 
+/**
+ * Token usage of one answer, as reported by the provider, plus a cost estimate
+ * where pricing is pinned. `estCostUsd` is absent when we refuse to guess
+ * (Groq pricing is not pinned here) — the UI shows tokens only in that case.
+ */
+export interface AnswerUsage {
+  /** Model that actually served the answer — what the cost/latency compare is keyed on. */
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  /** Prompt-cache accounting (Anthropic only; 0 when the cache did not engage). */
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /** Estimated cost of this answer in USD. Absent when pricing is not pinned for the model. */
+  estCostUsd?: number;
+}
+
 /** Wall-clock latency of one answer, measured in main. Surfaced so regressions are visible in the UI. */
 export interface AnswerMetrics {
   /** Stop pressed → final transcript in hand. */
@@ -68,6 +112,8 @@ export interface AnswerMetrics {
   firstTokenMs: number;
   /** Stop pressed → answer complete. */
   totalMs: number;
+  /** Tokens + estimated cost, when the provider reported usage. */
+  usage?: AnswerUsage;
 }
 
 // Events streamed from main to the renderer. Every event is tagged with the

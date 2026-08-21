@@ -57,3 +57,36 @@ export function latencyTitle(m: AnswerMetrics): string {
     `full answer ${(m.totalMs / 1000).toFixed(1)} s`
   );
 }
+
+/**
+ * The cost/usage chip next to the latency chip: "$0.0023" when pricing is
+ * pinned for the model, otherwise a token count so Groq answers still show
+ * something honest. Empty string when the provider reported no usage at all
+ * (the chip hides itself).
+ */
+export function costLabel(m: AnswerMetrics): string {
+  const u = m.usage;
+  if (!u) return '';
+  if (u.estCostUsd !== undefined) {
+    // Four decimals: single answers land around $0.002–0.03 and two decimals
+    // would render everything below Opus as a flat "$0.00".
+    return `$${u.estCostUsd.toFixed(4)}`;
+  }
+  return `${u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens}→${u.outputTokens} tok`;
+}
+
+/** Hover breakdown for the cost chip: model + the full token accounting. */
+export function costTitle(m: AnswerMetrics): string {
+  const u = m.usage;
+  if (!u) return '';
+  const parts = [
+    `${u.model}`,
+    `${u.inputTokens} in / ${u.outputTokens} out`,
+  ];
+  // Cache lines only when caching actually did something — a wall of zeros
+  // teaches nothing.
+  if (u.cacheReadTokens > 0) parts.push(`${u.cacheReadTokens} cached read (0.1x)`);
+  if (u.cacheWriteTokens > 0) parts.push(`${u.cacheWriteTokens} cache write (1.25x)`);
+  if (u.estCostUsd === undefined) parts.push('cost not shown: pricing not pinned for this model');
+  return parts.join(' · ');
+}

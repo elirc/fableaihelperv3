@@ -1,26 +1,22 @@
-import type { AnswerStyle, AppError } from '../../shared/types';
+import { DEFAULT_GROQ_MODEL, type AnswerStyle, type AppError } from '../../shared/types';
 import type { LlmProvider } from '../session';
 import { buildSystemPrompt, buildUserMessage } from '../prompt';
-import { parseSSEChunk, parseSSETail } from '../sse';
+import { parseSSEChunk, parseSSETail, type SseUsage } from '../sse';
 
 // Groq — the user-selectable "fastest" preset. OpenAI-compatible SSE
 // streaming, parsed with the same battle-tested chunk parser v1 used for
-// DeepSeek.
+// DeepSeek. The model is a Settings pick from GROQ_MODELS (shared/types.ts);
+// `openai/gpt-oss-120b` stays the default (Groq's recommended replacement for
+// the retired llama-3.3-70b-versatile, ~500 tok/s).
 const API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-
-// Was `llama-3.3-70b-versatile`, which Groq announced as deprecated on
-// 2026-06-17 with a hard shutdown on 2026-08-16 — it would have started
-// returning errors within weeks. `openai/gpt-oss-120b` is Groq's own
-// recommended replacement for it, is on the production model list, and runs at
-// ~500 tok/s, which is what this preset is for.
-const MODEL = 'openai/gpt-oss-120b';
 
 // gpt-oss is a reasoning model, and reasoning is the enemy of time-to-first-word:
 // left alone it thinks before it answers, and the user stares at an empty panel.
 // `reasoning_effort: 'low'` keeps that to a minimum, and `include_reasoning:
 // false` keeps the reasoning out of the response entirely. Note gpt-oss does NOT
 // accept `reasoning_format` (that is the Qwen-family knob) — these two are the
-// supported controls for this model family.
+// supported controls for this model family. Non-reasoning models (the llama
+// entry) reject these params, so they are sent only to the gpt-oss family.
 const REASONING_EFFORT = 'low';
 
 // Parity with anthropic.ts's MAX_TOKENS. Spoken answers are short; an uncapped
@@ -34,20 +30,25 @@ export function createGroqProvider(
   resume: string,
   jd: string,
   answerStyle: AnswerStyle,
+  model: string = DEFAULT_GROQ_MODEL,
 ): LlmProvider {
   const system = buildSystemPrompt(resume, jd, answerStyle);
+  const isReasoningModel = model.startsWith('openai/gpt-oss');
 
   return {
-    async generate(transcript, onDelta, signal) {
+    async generate(transcript, onDelta, signal, onUsage) {
       // Serialized once so a retry re-sends byte-identical bytes (and does not
       // pay JSON.stringify twice) — same shape as the Anthropic provider.
       const body = JSON.stringify({
-        model: MODEL,
+        model,
         stream: true,
         temperature: 0.7,
         max_completion_tokens: MAX_COMPLETION_TOKENS,
-        reasoning_effort: REASONING_EFFORT,
-        include_reasoning: false,
+        ...(isReasoningModel ? { reasoning_effort: REASONING_EFFORT, include_reasoning: false } : {}),
+        // Ask for token accounting on the final chunk so the answer can carry
+        // a tokens chip. No cost estimate for Groq — pricing is not pinned
+        // here (see llm/pricing.ts), and a wrong number is worse than none.
+        stream_options: { include_usage: true },
         messages: [
           { role: 'system', content: system },
           { role: 'user', content: buildUserMessage(transcript) },
@@ -95,7 +96,7 @@ export function createGroqProvider(
         // Reading the body can itself fail on a dropped connection; an error
         // about the error is not worth crashing over.
         const body = (await res.text().catch(() => '')).slice(0, 300);
-        throw httpError(res.status, body);
+        throw httpError(res.status, body, model);
       }
 
       // 200 with no body: `res.body!.getReader()` used to throw a raw
@@ -109,6 +110,7 @@ export function createGroqProvider(
       const decoder = new TextDecoder();
       let buf = '';
       let full = '';
+      let sseUsage: SseUsage | undefined;
       const emit = (delta: string): void => {
         full += delta;
         onDelta(delta);
@@ -119,8 +121,9 @@ export function createGroqProvider(
           const { done, value } = await reader.read();
           if (done) break;
           buf += decoder.decode(value, { stream: true });
-          const { deltas, rest } = parseSSEChunk(buf);
+          const { deltas, rest, usage } = parseSSEChunk(buf);
           buf = rest;
+          if (usage) sseUsage = usage;
           for (const delta of deltas) emit(delta);
         }
       } catch (err) {
@@ -137,7 +140,20 @@ export function createGroqProvider(
       //   parseSSETail(buf) — emits a final `data:` line that arrived without its
       //                       trailing newline, which parseSSEChunk cannot flush.
       buf += decoder.decode();
-      for (const delta of parseSSETail(buf)) emit(delta);
+      const tail = parseSSETail(buf);
+      if (tail.usage) sseUsage = tail.usage;
+      for (const delta of tail.deltas) emit(delta);
+
+      if (sseUsage && typeof sseUsage.prompt_tokens === 'number' && typeof sseUsage.completion_tokens === 'number') {
+        onUsage?.({
+          model,
+          inputTokens: sseUsage.prompt_tokens,
+          outputTokens: sseUsage.completion_tokens,
+          cacheReadTokens: 0, // no prompt caching on this path
+          cacheWriteTokens: 0,
+          // estCostUsd deliberately absent: Groq pricing is not pinned here.
+        });
+      }
 
       return full;
     },
@@ -148,7 +164,7 @@ function abortedError(): AppError {
   return { code: 'aborted', message: 'Answer cancelled.' };
 }
 
-function httpError(status: number, body: string): AppError {
+function httpError(status: number, body: string, model: string): AppError {
   if (status === 401 || status === 403) {
     // Both are key problems, but report the status we actually got — a 403
     // labelled "(401)" sends the user debugging the wrong thing.
@@ -164,7 +180,7 @@ function httpError(status: number, body: string): AppError {
     // Most likely cause here is Groq retiring the pinned model out from under us.
     return {
       code: 'llm_http',
-      message: `Groq does not recognise the model "${MODEL}" (404). It may have been retired — update MODEL in llm/groq.ts.`,
+      message: `Groq does not recognise the model "${model}" (404). It may have been retired — pick a different Groq model in Settings.`,
     };
   }
   if (status >= 500) {

@@ -790,3 +790,53 @@ describe('toAppError', () => {
     expect(toAppError(new Error('boom'), 'llm_http')).toEqual({ code: 'llm_http', message: 'boom' });
   });
 });
+
+describe('SessionManager usage threading', () => {
+  const USAGE = {
+    model: 'claude-haiku-4-5',
+    inputTokens: 1500,
+    outputTokens: 300,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    estCostUsd: 0.003,
+  };
+
+  function usageLlm(): LlmProvider {
+    return {
+      async generate(_transcript, onDelta, _signal, onUsage) {
+        onDelta('answer');
+        onUsage?.(USAGE);
+        return 'answer';
+      },
+    };
+  }
+
+  test('usage reported by the provider lands on the done metrics', async () => {
+    const { log, events } = collectEvents();
+    const mgr = new SessionManager({ createStt: async () => new FakeStt(), createLlm: usageLlm, events });
+    const id = await mgr.start();
+    await mgr.stop(id);
+    const m = (log.find((e) => e.type === 'done')!.data as { metrics: AnswerMetrics }).metrics;
+    expect(m.usage).toEqual(USAGE);
+  });
+
+  test('ask() sessions carry usage too', async () => {
+    const { log, events } = collectEvents();
+    const mgr = new SessionManager({ createStt: async () => new FakeStt(), createLlm: usageLlm, events });
+    await mgr.ask('what are react hooks');
+    await until(() => log.some((e) => e.type === 'done'));
+    const m = (log.find((e) => e.type === 'done')!.data as { metrics: AnswerMetrics }).metrics;
+    expect(m.usage).toEqual(USAGE);
+  });
+
+  test('a provider that reports no usage produces metrics WITHOUT a usage key', async () => {
+    // Pinned as a key-absence check: `usage: undefined` would survive toEqual
+    // but break consumers that iterate metric keys or JSON-roundtrip them.
+    const { log, events } = collectEvents();
+    const mgr = new SessionManager({ createStt: async () => new FakeStt(), createLlm: () => fakeLlm(), events });
+    const id = await mgr.start();
+    await mgr.stop(id);
+    const m = (log.find((e) => e.type === 'done')!.data as { metrics: AnswerMetrics }).metrics;
+    expect('usage' in m).toBe(false);
+  });
+});

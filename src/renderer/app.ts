@@ -1,14 +1,31 @@
-import { DEFAULT_HOTKEY } from '../shared/types';
+import {
+  ANTHROPIC_MODELS,
+  DEFAULT_ANTHROPIC_MODEL,
+  DEFAULT_GROQ_MODEL,
+  DEFAULT_HOTKEY,
+  GROQ_MODELS,
+} from '../shared/types';
 import type {
   AnswerMetrics,
   AnswerStyle,
+  AnthropicModelId,
+  AudioSource,
+  GroqModelId,
   LlmProviderId,
   RendererApi,
   Result,
   SettingsPatch,
   SettingsView,
 } from '../shared/types';
-import { errorMessage, formatAccelerator, formatTimer, latencyLabel, latencyTitle } from './format';
+import {
+  costLabel,
+  costTitle,
+  errorMessage,
+  formatAccelerator,
+  formatTimer,
+  latencyLabel,
+  latencyTitle,
+} from './format';
 import { createMarkdownView } from './markdown';
 
 declare global {
@@ -36,6 +53,7 @@ const settingsError = $('settingsError');
 const liveTag = $('liveTag');
 const genTag = $('genTag');
 const latencyTag = $('latencyTag');
+const costTag = $('costTag');
 const copyBtn = $<HTMLButtonElement>('copyBtn');
 const copyLabel = $('copyLabel');
 const historyBar = $('historyBar');
@@ -56,8 +74,8 @@ const settingsHeading = $('settingsHeading');
 const MAX_SECONDS = 120; // safety cap per clip
 const MAX_HISTORY = 6; // Q/A pairs kept in memory
 const MAX_PENDING_FRAMES = 120; // ~15 s of audio buffered while the session opens
-const BASE_READY_TEXT = 'Ready — press Record while the other person is speaking';
-const ANSWER_PLACEHOLDER = 'Your AI-suggested answer will stream here.';
+const BASE_READY_TEXT = 'Ready — press Record while your practice partner asks a question';
+const ANSWER_PLACEHOLDER = 'The model answer to practise against will stream here.';
 const TRANSCRIPT_PLACEHOLDER = 'The live transcript will appear here while you record.';
 
 const answerView = createMarkdownView(answerBox);
@@ -76,6 +94,9 @@ let recordStart = 0;
 let timerInterval: ReturnType<typeof setInterval> | null = null;
 let hotkeyLabel = '';
 let hotkeyActive = false;
+// Mirrors the saved setting; startCapture reads it at record time, so a save
+// in Settings applies to the very next recording without a restart.
+let audioSource: AudioSource = 'microphone';
 
 interface Entry {
   question: string;
@@ -95,26 +116,58 @@ interface Capture {
 }
 
 /**
- * Opens system-audio loopback and streams Int16 frames to `onFrame`. The caller
- * owns the returned handle: each recording run stops its own capture, so a run
- * that loses a race can never stop the capture of the run that replaced it.
+ * Opens the configured audio source (microphone by default, system-audio
+ * loopback for the 'system' setting) and streams Int16 frames to `onFrame`.
+ * The caller owns the returned handle: each recording run stops its own
+ * capture, so a run that loses a race can never stop the capture of the run
+ * that replaced it.
  */
 async function startCapture(onFrame: (pcm: ArrayBuffer, rms: number) => void): Promise<Capture> {
-  // getDisplayMedia is routed to system-audio loopback by the main process.
-  // Prefer audio-only; fall back to the discarded-video workaround if the
-  // Electron version insists on a video track.
   let stream: MediaStream;
-  try {
-    stream = await navigator.mediaDevices.getDisplayMedia({ video: false, audio: true } as MediaStreamConstraints);
-  } catch {
-    stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-    stream.getVideoTracks().forEach((t) => t.stop());
+  if (audioSource === 'system') {
+    // getDisplayMedia is routed to system-audio loopback by the main process.
+    // Prefer audio-only; fall back to the discarded-video workaround if the
+    // Electron version insists on a video track.
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: false, audio: true } as MediaStreamConstraints);
+    } catch {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      stream.getVideoTracks().forEach((t) => t.stop());
+    }
+  } else {
+    // Practice-partner-in-the-room default. Echo cancellation and noise
+    // suppression stay on: the partner's voice is the signal, and any audio
+    // this PC plays (including a re-read of an earlier answer) is noise.
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (err) {
+      // First-run mic failures are exactly where a specific hint pays off:
+      // "permission denied" and "no device" send the user to different places.
+      const name = err instanceof DOMException ? err.name : '';
+      if (name === 'NotAllowedError') {
+        throw new Error(
+          'Microphone access is blocked. Allow it in Windows Settings > Privacy & security > Microphone, then try again.',
+        );
+      }
+      if (name === 'NotFoundError') {
+        throw new Error('No microphone found. Plug one in, or pick a different input device in Windows sound settings.');
+      }
+      throw new Error(
+        'Could not open the microphone. Check Windows microphone permissions for this app, or switch the audio source in Settings.',
+      );
+    }
   }
 
   const audioTracks = stream.getAudioTracks();
   if (audioTracks.length === 0) {
     stream.getTracks().forEach((t) => t.stop());
-    throw new Error('Could not capture system audio. Make sure audio is playing on this PC.');
+    throw new Error(
+      audioSource === 'system'
+        ? 'Could not capture system audio. Make sure audio is playing on this PC.'
+        : 'The microphone opened but produced no audio track. Check the input device in Windows sound settings.',
+    );
   }
 
   // Ask Chromium to resample to 16 kHz for us; the worklet downsamples itself
@@ -398,12 +451,13 @@ function setState(next: State): void {
     case 'starting':
       recordLabel.textContent = 'Starting…';
       statusDot.className = 'dot busy';
-      statusText.textContent = 'Opening the microphone feed…';
+      statusText.textContent =
+        audioSource === 'system' ? 'Opening the system-audio feed…' : 'Opening the microphone…';
       break;
     case 'recording':
       recordLabel.textContent = 'Stop & Answer';
       statusDot.className = 'dot recording';
-      statusText.textContent = 'Recording call audio…';
+      statusText.textContent = 'Listening to the question…';
       break;
     case 'finalizing':
       recordLabel.textContent = 'Record';
@@ -521,8 +575,14 @@ function renderEntry(): void {
     latencyTag.hidden = false;
     latencyTag.textContent = latencyLabel(m);
     latencyTag.title = latencyTitle(m);
+    // Cost/tokens chip: empty label means the provider reported no usage.
+    const cost = costLabel(m);
+    costTag.hidden = cost === '';
+    costTag.textContent = cost;
+    costTag.title = costTitle(m);
   } else {
     latencyTag.hidden = true;
+    costTag.hidden = true;
   }
 
   historyBar.hidden = entries.length <= 1;
@@ -651,9 +711,22 @@ const textFields = ['resume', 'jobDescription'] as const;
 const keyFields = ['deepgramKey', 'anthropicKey', 'groqKey'] as const;
 const PROVIDERS: readonly string[] = ['anthropic', 'groq'];
 const STYLES: readonly string[] = ['brief', 'balanced', 'detailed'];
+const SOURCES: readonly string[] = ['microphone', 'system'];
 
 const asProvider = (v: string): LlmProviderId => (PROVIDERS.includes(v) ? (v as LlmProviderId) : 'anthropic');
 const asStyle = (v: string): AnswerStyle => (STYLES.includes(v) ? (v as AnswerStyle) : 'balanced');
+const asSource = (v: string): AudioSource => (SOURCES.includes(v) ? (v as AudioSource) : 'microphone');
+const asAnthropicModel = (v: string): AnthropicModelId =>
+  (ANTHROPIC_MODELS as readonly string[]).includes(v) ? (v as AnthropicModelId) : DEFAULT_ANTHROPIC_MODEL;
+const asGroqModel = (v: string): GroqModelId =>
+  (GROQ_MODELS as readonly string[]).includes(v) ? (v as GroqModelId) : DEFAULT_GROQ_MODEL;
+
+// Only the active provider's model picker is live; the other is grayed out so
+// changing it (and wondering why nothing happened) is impossible.
+function syncModelPickers(provider: string): void {
+  $<HTMLSelectElement>('anthropicModel').disabled = provider !== 'anthropic';
+  $<HTMLSelectElement>('groqModel').disabled = provider !== 'groq';
+}
 
 // ---------- Answer-style quick toggle ----------
 // Flipping the style is latency-free by design: the cached prompt prefix is
@@ -702,6 +775,11 @@ function applyHotkeyUi(s: SettingsView): void {
 function fillSettingsForm(s: SettingsView): void {
   for (const f of textFields) $<HTMLTextAreaElement>(f).value = s[f];
   $<HTMLSelectElement>('llmProvider').value = s.llmProvider;
+  syncModelPickers(s.llmProvider);
+  $<HTMLSelectElement>('anthropicModel').value = s.anthropicModel;
+  $<HTMLSelectElement>('groqModel').value = s.groqModel;
+  $<HTMLSelectElement>('audioSource').value = s.audioSource;
+  audioSource = s.audioSource; // keep the capture path in sync with what is shown
   $<HTMLSelectElement>('answerStyle').value = s.answerStyle;
   $<HTMLInputElement>('alwaysOnTop').checked = s.alwaysOnTop;
   const hotkeyInput = $<HTMLInputElement>('hotkey');
@@ -740,6 +818,11 @@ settingsBtn.addEventListener('click', async () => {
 
 $('backBtn').addEventListener('click', () => closeSettings());
 
+// Live-gate the model pickers as the provider selection changes (before Save).
+$<HTMLSelectElement>('llmProvider').addEventListener('change', (e) => {
+  syncModelPickers((e.target as HTMLSelectElement).value);
+});
+
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !settingsView.hidden) {
     e.preventDefault();
@@ -753,6 +836,9 @@ $('saveBtn').addEventListener('click', async () => {
     resume: $<HTMLTextAreaElement>('resume').value,
     jobDescription: $<HTMLTextAreaElement>('jobDescription').value,
     llmProvider: asProvider($<HTMLSelectElement>('llmProvider').value),
+    anthropicModel: asAnthropicModel($<HTMLSelectElement>('anthropicModel').value),
+    groqModel: asGroqModel($<HTMLSelectElement>('groqModel').value),
+    audioSource: asSource($<HTMLSelectElement>('audioSource').value),
     answerStyle: asStyle($<HTMLSelectElement>('answerStyle').value),
     hotkey: $<HTMLInputElement>('hotkey').value.trim(),
     alwaysOnTop: $<HTMLInputElement>('alwaysOnTop').checked,
@@ -787,6 +873,7 @@ void (async () => {
     const s = await api.getSettings();
     applyHotkeyUi(s);
     syncStyleChips(s.answerStyle);
+    audioSource = s.audioSource;
     const missingLlmKey = s.llmProvider === 'groq' ? !s.hasGroqKey : !s.hasAnthropicKey;
     if ((!s.hasDeepgramKey || missingLlmKey) && state === 'idle') {
       statusText.textContent = 'First run: open Settings (gear icon) and add your API keys';

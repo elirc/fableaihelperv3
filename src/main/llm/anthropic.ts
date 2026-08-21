@@ -1,52 +1,64 @@
 import Anthropic from '@anthropic-ai/sdk';
-import type { AnswerStyle, AppError } from '../../shared/types';
+import { DEFAULT_ANTHROPIC_MODEL, type AnswerStyle, type AppError } from '../../shared/types';
 import type { LlmProvider } from '../session';
 import { buildSystemPromptBlocks, buildUserMessage } from '../prompt';
+import { estimateCostUsd } from './pricing';
 
-// Claude Haiku 4.5 — verified current (200K context, $1/$5 per MTok). It is the
-// fastest/cheapest tier Anthropic ships, which is the whole reason it is here:
-// this app is judged on stop-to-first-word, and Haiku wins that. The bigger
-// models are better writers but not better *here* — the answer is short, the
-// grounding is spoon-fed in the system prompt, and every extra 100 ms of TTFT
-// is worse than a slightly nicer sentence. (Opus fast mode is the only faster-
-// than-standard option and it is Opus-tier priced and still not Haiku-fast.)
-const MODEL = 'claude-haiku-4-5';
+// The model is now a Settings pick from ANTHROPIC_MODELS (shared/types.ts) so
+// the user can compare latency/cost/quality across tiers on the same question.
+// Haiku 4.5 stays the default: this app is judged on stop-to-first-word, and
+// Haiku wins that. Sonnet 5 and Opus 5 are better writers at 3x/5x the price
+// and a slower first token — the per-answer cost chip and the latency chip
+// exist precisely so that trade is measured instead of guessed.
 const MAX_TOKENS = 1024; // spoken-answer length; interview answers are short
+
+// Sonnet 5 / Opus 5 run *adaptive thinking by default* (Haiku 4.5 has no such
+// default). Left alone, the model may think before the first visible token —
+// which is exactly the budget this app protects — so thinking is explicitly
+// disabled for those models. Two footnotes, verified against the current API:
+//   * `{type: 'disabled'}` is accepted on Opus 5 only at effort `high` or
+//     below; the default effort is `high`, and we never set xhigh/max here.
+//   * Haiku 4.5 never thinks unless explicitly asked to (the older
+//     enabled+budget_tokens config), so it needs — and gets — no parameter.
+const THINKING_DISABLED_MODELS = new Set(['claude-sonnet-5', 'claude-opus-5']);
 
 // Prompt caching, honestly:
 //
-// Haiku 4.5's minimum cacheable prefix really is 4096 tokens (Opus 4.x and
-// Haiku 4.5 are the 4096 tier; Sonnet 4.5 and older are 1024). So the marker
-// below is a *silent no-op* for a typical resume+JD, which lands around
-// 1-2K tokens — no error, nothing cached, full price. It only starts paying at
-// roughly 16K+ characters of profile.
+// The minimum cacheable prefix is PER MODEL: Haiku 4.5 = 4096 tokens,
+// Sonnet 5 = 1024, Opus 5 = 512. A typical resume+JD lands around 1-2K
+// tokens, so on the Haiku default the marker below is a *silent no-op* — no
+// error, nothing cached, full price — until the profile reaches roughly 16K+
+// characters. On Sonnet 5 and Opus 5 the same profile DOES cache, so those
+// models get 0.1x cached-prefix reads from the second question onward.
 //
-// It stays because when it does engage it is free money: cache writes cost
-// 1.25x and reads 0.1x, so it breaks even on the second question of an
-// interview and every question after that is both cheaper and faster to first
+// The marker stays on every model because when it engages it is free money:
+// cache writes cost 1.25x and reads 0.1x, so it breaks even on the second
+// question and every question after that is both cheaper and faster to first
 // token. The breakpoint sits at the end of the resume+JD block, so the
 // volatile answer-style instruction (which follows it) can change without
-// throwing the cache away. Read `usage.cache_read_input_tokens` if you ever
-// want to check whether it is actually engaging.
+// throwing the cache away. The cost chip's hover shows `cached read` tokens
+// when it is actually engaging (fed from `usage.cache_read_input_tokens`).
 export function createAnthropicProvider(
   apiKey: string,
   resume: string,
   jd: string,
   answerStyle: AnswerStyle,
+  model: string = DEFAULT_ANTHROPIC_MODEL,
 ): LlmProvider {
   // maxRetries: 0 — the SDK's default retry policy backs off for seconds, which
-  // is forever in an interview. We do our own single, immediate, tightly-scoped
+  // is forever mid-practice. We do our own single, immediate, tightly-scoped
   // retry below instead.
   const client = new Anthropic({ apiKey, maxRetries: 0 });
   const { cachedPrefix, styleSuffix } = buildSystemPromptBlocks(resume, jd, answerStyle);
 
   return {
-    async generate(transcript, onDelta, signal) {
+    async generate(transcript, onDelta, signal, onUsage) {
       // Built once so a retry re-sends byte-identical bytes and can still hit
       // the cache the first attempt may have written.
       const params: Anthropic.MessageStreamParams = {
-        model: MODEL,
+        model,
         max_tokens: MAX_TOKENS,
+        ...(THINKING_DISABLED_MODELS.has(model) ? { thinking: { type: 'disabled' as const } } : {}),
         system: [
           { type: 'text', text: cachedPrefix, cache_control: { type: 'ephemeral' } },
           // After the breakpoint: changing answerStyle costs nothing.
@@ -70,6 +82,21 @@ export function createAnthropicProvider(
         // snapshot) and we must never let the running snapshot through as a delta.
         stream.on('text', (delta) => emit(delta));
         const final = await stream.finalMessage();
+        // Usage is on the final message; report it (with the cost estimate)
+        // before returning so the session can attach it to the metrics. The
+        // cache_* fields are how you check whether prompt caching is actually
+        // engaging (see the caching note above): read tokens at 0.1x mean it
+        // is; everything landing in input_tokens means the prefix is under the
+        // model's minimum cacheable size.
+        const u = final.usage;
+        const counts = {
+          inputTokens: u.input_tokens,
+          outputTokens: u.output_tokens,
+          cacheReadTokens: u.cache_read_input_tokens ?? 0,
+          cacheWriteTokens: u.cache_creation_input_tokens ?? 0,
+        };
+        const estCostUsd = estimateCostUsd(model, counts);
+        onUsage?.({ model, ...counts, ...(estCostUsd !== undefined ? { estCostUsd } : {}) });
         // Concatenation of the text blocks == concatenation of the text deltas
         // that produced them, so the returned answer cannot diverge from what
         // was streamed. Do NOT "simplify" this to stream.finalText(): that
@@ -94,16 +121,16 @@ export function createAnthropicProvider(
           try {
             return await runOnce();
           } catch (retryErr) {
-            throw toLlmError(retryErr, signal);
+            throw toLlmError(retryErr, signal, model);
           }
         }
-        throw toLlmError(err, signal);
+        throw toLlmError(err, signal, model);
       }
     },
   };
 }
 
-function toLlmError(err: unknown, signal: AbortSignal): AppError {
+function toLlmError(err: unknown, signal: AbortSignal, model: string): AppError {
   // MUST come first. The SDK reports a caller abort as APIUserAbortError, which
   // extends APIError with status === undefined — so the generic APIError branch
   // below would otherwise turn a user pressing record again into the scary
@@ -118,7 +145,7 @@ function toLlmError(err: unknown, signal: AbortSignal): AppError {
   if (err instanceof Anthropic.PermissionDeniedError) {
     return {
       code: 'llm_auth',
-      message: 'This Anthropic API key is not allowed to use ' + MODEL + ' (403). Check the key in Settings.',
+      message: 'This Anthropic API key is not allowed to use ' + model + ' (403). Check the key in Settings.',
     };
   }
   if (err instanceof Anthropic.RateLimitError) {

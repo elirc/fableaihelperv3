@@ -38,7 +38,7 @@ function createWindow(): void {
     height: 700,
     minWidth: 380,
     minHeight: 520,
-    title: 'AI Call Assistant',
+    title: 'Interview Practice Partner',
     autoHideMenuBar: true,
     alwaysOnTop: getAlwaysOnTop(),
     backgroundColor: '#16181d',
@@ -50,8 +50,10 @@ function createWindow(): void {
     },
   });
 
-  // Hide the window from screen sharing / screen recording (WDA_EXCLUDEFROMCAPTURE).
-  win.setContentProtection(true);
+  // v1 hid this window from screen capture (setContentProtection). Removed on
+  // purpose in the practice-tool rework: there is nothing to hide from anyone,
+  // and being visible in a screen share lets the user record or stream their
+  // own practice sessions to review later.
 
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
 
@@ -67,8 +69,10 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
-  // Route getDisplayMedia to Windows system-audio loopback so the app can hear
-  // whatever the call application is playing, without any screen picker UI.
+  // Route getDisplayMedia to Windows system-audio loopback for the 'system'
+  // audio source (practising against a video call or a played question list) —
+  // the app hears whatever this PC is playing, without any screen picker UI.
+  // The default 'microphone' source never comes through here.
   session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
     desktopCapturer
       // thumbnailSize 0: only `audio: 'loopback'` is wanted here, and the

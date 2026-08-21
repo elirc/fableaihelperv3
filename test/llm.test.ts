@@ -663,3 +663,100 @@ describe('groq provider — single retry on connection failure', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('model selection and usage reporting', () => {
+  function groqStream(body: string): Response {
+    return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  }
+  function groqLine(content: string): string {
+    return 'data: ' + JSON.stringify({ choices: [{ delta: { content } }] }) + '\n\n';
+  }
+
+  test('anthropic: the default model sends NO thinking parameter (Haiku predates it)', async () => {
+    const fetchMock = vi.fn(async (..._args: FetchArgs) => anthropicStream([['x']]));
+    vi.stubGlobal('fetch', fetchMock);
+    await anthropic().generate('q', noop, new AbortController().signal);
+    const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body.model).toBe('claude-haiku-4-5');
+    expect(body.thinking).toBeUndefined();
+  });
+
+  test('anthropic: a model override reaches the body and disables default-on thinking', async () => {
+    // Sonnet 5 / Opus 5 think by default; left alone they would spend the
+    // first-token budget reasoning. The provider must explicitly turn it off.
+    const fetchMock = vi.fn(async (..._args: FetchArgs) => anthropicStream([['x']]));
+    vi.stubGlobal('fetch', fetchMock);
+    await createAnthropicProvider('sk-test', 'resume', 'jd', 'balanced', 'claude-sonnet-5').generate(
+      'q',
+      noop,
+      new AbortController().signal,
+    );
+    const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body.model).toBe('claude-sonnet-5');
+    expect(body.thinking).toEqual({ type: 'disabled' });
+  });
+
+  test('anthropic: reports usage with a cost estimate for a pinned-pricing model', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => anthropicStream([['hi']])));
+    let usage: import('../src/shared/types').AnswerUsage | undefined;
+    await anthropic().generate('q', noop, new AbortController().signal, (u) => {
+      usage = u;
+    });
+    // anthropicStream reports input 10 (message_start) and output 5 (message_delta).
+    expect(usage).toMatchObject({
+      model: 'claude-haiku-4-5',
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+    });
+    expect(usage!.estCostUsd).toBeCloseTo((10 * 1 + 5 * 5) / 1e6, 12);
+  });
+
+  test('groq: asks for usage accounting on the final chunk', async () => {
+    const fetchMock = vi.fn(async (..._args: FetchArgs) => groqStream(groqLine('x') + 'data: [DONE]\n\n'));
+    vi.stubGlobal('fetch', fetchMock);
+    await groq().generate('q', noop, new AbortController().signal);
+    const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body.stream_options).toEqual({ include_usage: true });
+  });
+
+  test('groq: a non-reasoning model gets no reasoning params (it would reject them)', async () => {
+    const fetchMock = vi.fn(async (..._args: FetchArgs) => groqStream(groqLine('x') + 'data: [DONE]\n\n'));
+    vi.stubGlobal('fetch', fetchMock);
+    await createGroqProvider('gsk-test', 'resume', 'jd', 'balanced', 'llama-3.1-8b-instant').generate(
+      'q',
+      noop,
+      new AbortController().signal,
+    );
+    const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body.model).toBe('llama-3.1-8b-instant');
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(body.include_reasoning).toBeUndefined();
+  });
+
+  test('groq: usage from the final chunk reaches onUsage — tokens only, no invented cost', async () => {
+    const usageChunk =
+      'data: ' + JSON.stringify({ choices: [], usage: { prompt_tokens: 12, completion_tokens: 3 } }) + '\n\n';
+    vi.stubGlobal('fetch', vi.fn(async () => groqStream(groqLine('hi') + usageChunk + 'data: [DONE]\n\n')));
+    let usage: import('../src/shared/types').AnswerUsage | undefined;
+    await groq().generate('q', noop, new AbortController().signal, (u) => {
+      usage = u;
+    });
+    expect(usage).toEqual({
+      model: 'openai/gpt-oss-120b',
+      inputTokens: 12,
+      outputTokens: 3,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+    });
+    expect(usage!.estCostUsd).toBeUndefined();
+  });
+
+  test('groq: a stream with no usage chunk simply never calls onUsage', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => groqStream(groqLine('hi') + 'data: [DONE]\n\n')));
+    const onUsage = vi.fn();
+    await groq().generate('q', noop, new AbortController().signal, onUsage);
+    expect(onUsage).not.toHaveBeenCalled();
+  });
+});

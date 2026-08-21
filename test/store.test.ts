@@ -429,3 +429,53 @@ describe('store persistence', () => {
     expect(readSettings().resume).toBe('r');
   });
 });
+
+describe('practice-mode settings (audio source and model picks)', () => {
+  test('defaults: microphone source and the latency-first models', async () => {
+    const store = await freshStore();
+    const v = store.getSettingsView();
+    expect(v.audioSource).toBe('microphone');
+    expect(v.anthropicModel).toBe('claude-haiku-4-5');
+    expect(v.groqModel).toBe('openai/gpt-oss-120b');
+  });
+
+  test('a settings.json written before these fields existed falls back to the defaults', async () => {
+    // The practice rework must not brick a v2.0 settings file.
+    writeSettings({ resume: 'keep me', llmProvider: 'groq' });
+    const store = await freshStore();
+    const v = store.getSettingsView();
+    expect(v.resume).toBe('keep me');
+    expect(v.audioSource).toBe('microphone');
+    expect(v.anthropicModel).toBe('claude-haiku-4-5');
+    expect(v.groqModel).toBe('openai/gpt-oss-120b');
+  });
+
+  test('patched values persist and reach getProfile', async () => {
+    let store = await freshStore();
+    store.applySettingsPatch({
+      audioSource: 'system',
+      anthropicModel: 'claude-sonnet-5',
+      groqModel: 'llama-3.1-8b-instant',
+    });
+    store = await freshStore(); // re-read from disk, no cache
+    expect(store.getSettingsView().audioSource).toBe('system');
+    const profile = store.getProfile();
+    expect(profile.anthropicModel).toBe('claude-sonnet-5');
+    expect(profile.groqModel).toBe('llama-3.1-8b-instant');
+  });
+
+  test('a model no longer in the curated list falls back instead of failing the file', async () => {
+    writeSettings({
+      resume: 'keep me',
+      audioSource: 'telepathy',
+      anthropicModel: 'claude-2.1',
+      groqModel: 'mixtral-8x7b-32768',
+    });
+    const store = await freshStore();
+    const v = store.getSettingsView();
+    expect(v.resume).toBe('keep me'); // per-field fallback, not whole-file reset
+    expect(v.audioSource).toBe('microphone');
+    expect(v.anthropicModel).toBe('claude-haiku-4-5');
+    expect(v.groqModel).toBe('openai/gpt-oss-120b');
+  });
+});

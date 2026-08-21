@@ -1,7 +1,7 @@
 # Test Documentation
 
 Every test in the suite, what it verifies, and why it exists. The suite runs
-with `npm test` (vitest) — **379 tests across 10 files, no Electron and no
+with `npm test` (vitest) — **416 tests across 11 files, no Electron and no
 network required**. Electron APIs are mocked where needed (`store`), network
 protocols are driven through fakes at the wire level (a mock WebSocket for
 Deepgram, a stubbed `fetch` serving real SSE bytes for the LLM providers), and
@@ -17,16 +17,17 @@ test can be judged against the reason the test was written.
 
 | File | Tests | Covers |
 |---|---|---|
-| `test/session.test.ts` | 39 | Session manager: lifecycle, supersession, timeouts, metrics, the `ask()` path |
+| `test/session.test.ts` | 42 | Session manager: lifecycle, supersession, timeouts, metrics incl. usage, the `ask()` path |
 | `test/deepgram.test.ts` | 65 | Deepgram WS client: connect races, buffering, keepalive, finalize, error contract |
 | `test/pcm.test.ts` | 21 | PCM helpers: downsampling, Int16 conversion, RMS |
-| `test/llm.test.ts` | 42 | Both LLM providers: streaming, caching layout, retries, full error-mapping matrix |
-| `test/sse.test.ts` | 26 | OpenAI-style SSE parser: chunk reassembly, tail flush, hostile payloads |
-| `test/prompt.test.ts` | 24 | Prompt builders: content, style handling, cache-prefix byte-stability |
+| `test/llm.test.ts` | 49 | Both LLM providers: streaming, caching layout, retries, full error-mapping matrix |
+| `test/sse.test.ts` | 32 | OpenAI-style SSE parser: chunk reassembly, tail flush, usage extraction, hostile payloads |
+| `test/prompt.test.ts` | 26 | Prompt builders: content, style handling, cache-prefix byte-stability |
 | `test/warm.test.ts` | 16 | LLM connection pre-warm: URLs, throttling, never-throws, pooling |
 | `test/markdown.test.ts` | 81 | Markdown parser + streaming DOM view: correctness, DOM reuse, XSS defence |
-| `test/store.test.ts` | 32 | Settings store: validation, secrets encryption, patch semantics, atomic writes |
-| `test/format.test.ts` | 33 | Renderer display helpers: accelerator labels, timer, errors, latency strings |
+| `test/store.test.ts` | 36 | Settings store: validation, secrets encryption, patch semantics, atomic writes |
+| `test/format.test.ts` | 41 | Renderer display helpers: accelerator labels, timer, errors, latency and cost chips |
+| `test/pricing.test.ts` | 7 | Pinned Anthropic pricing: per-tier rates, cache multipliers, never-guess fallback |
 
 ---
 
@@ -38,7 +39,7 @@ The session manager is the orchestrator: one live question/answer pipeline, inje
 
 - **happy path: audio routed, transcript finalized, answer streamed** — start → audio → stop produces the full event sequence: final `partial` with the transcript, `delta` with the answer, `done` last with transcript+answer. *Why:* this is the product's entire recorded-question pipeline in one assertion; any wiring regression breaks it first.
 - **starting a new session aborts the previous one** — a second `start()` returns a higher id, aborts the first STT stream, and drops audio addressed to the stale id. *Why:* "record again while an answer is streaming" is a supported gesture; a leaked socket or misrouted audio would corrupt the new session.
-- **an empty transcript reports no_speech** — a whitespace-only finalize surfaces `no_speech` instead of sending an empty prompt to the LLM. *Why:* the user gets an actionable error ("make sure call audio is playing") rather than a hallucinated answer to silence.
+- **an empty transcript reports no_speech** — a whitespace-only finalize surfaces `no_speech` instead of sending an empty prompt to the LLM. *Why:* the user gets an actionable error (pointing at the audio-source setting) rather than a hallucinated answer to silence.
 - **LLM first-token timeout produces a structured error and aborts** — a provider slower than `llmFirstTokenMs` yields `llm_first_token_timeout`. *Why:* the app's promise is fast first words; a hung provider must fail loudly and quickly, not hold the UI in "Answering…".
 - **cancel during a slow answer suppresses late events** — `cancel()` while the LLM is in flight yields neither `done` nor `error`. *Why:* aborts the user asked for must be silent; a spurious error dialog after pressing cancel is a bug.
 - **createStt failure propagates from start()** — a structured `no_stt_key` throw from the STT factory rejects `start()` with the same code. *Why:* the renderer maps this rejection to the "add your key in Settings" hint; wrapping it would destroy the code.
@@ -100,7 +101,7 @@ The session manager is the orchestrator: one live question/answer pipeline, inje
 
 #### parseDeepgramMessage
 
-- **extracts an interim transcript** — a `Results` frame with `is_final: false` decodes to `{ transcript, isFinal: false }`. *Why:* interims are what make the transcript render live while the other person is still speaking.
+- **extracts an interim transcript** — a `Results` frame with `is_final: false` decodes to `{ transcript, isFinal: false }`. *Why:* interims are what make the transcript render live while the practice partner is still speaking.
 - **extracts a final transcript** — a `Results` frame with `is_final: true` decodes with `isFinal: true`. *Why:* finals mark committed text; downstream logic (accumulation, UI styling) keys off this flag.
 - **returns an empty final so callers can clear the interim** — an empty-transcript final is returned, not swallowed. *Why:* an empty final is Deepgram's way of closing out a silent stretch; callers need it to clear a stale interim.
 - **ignores Metadata and other non-Results messages** — `Metadata`, `UtteranceEnd`, `SpeechStarted` all return null. *Why:* Deepgram interleaves housekeeping frames with transcripts; treating one as speech would corrupt the transcript.
@@ -353,9 +354,9 @@ The prompt builders are pure functions, and the split between cached prefix and 
 
 #### buildUserMessage
 
-- **wraps the transcript and asks what to say** — the transcript is embedded and the closing question present. *Why:* the basic user-turn contract.
-- **produces the exact wrapping format** — byte-exact equality with `'The other person on the call just said:\n"""\n' + transcript + '\n"""\n\nWhat should I say?'`. *Why:* the user turn ships with every request; silent wording drift would change token counts and model behaviour with no failing test.
-- **passes the transcript through verbatim, including newlines and quotes** — a multi-line transcript with quote characters survives unescaped. *Why:* the wrapper must never mangle what the interviewer actually said.
+- **wraps the transcript and asks for the model answer** — the transcript is embedded and the closing instruction present. *Why:* the basic user-turn contract.
+- **produces the exact wrapping format** — byte-exact equality with `'My practice partner just asked:\n"""\n' + transcript + '\n"""\n\nWrite the model answer.'`. *Why:* the user turn ships with every request; silent wording drift would change token counts and model behaviour with no failing test.
+- **passes the transcript through verbatim, including newlines and quotes** — a multi-line transcript with quote characters survives unescaped. *Why:* the wrapper must never mangle what the practice partner actually said.
 - **does not carry the answer style, so the user turn stays cache-neutral** — no style vocabulary in the user message. *Why:* style leaking into the user turn would bypass the carefully placed cache breakpoint.
 
 ### test/warm.test.ts
@@ -580,3 +581,70 @@ The settings store persists the profile and safeStorage-encrypted API keys. Runs
 - **mixes rounded ms for the stages with one-decimal seconds for the total** — fractional inputs produce `First word 1235 ms after Stop · transcript finalized 480 ms · full answer 5.7 s`. *Why:* pins the full hover-breakdown template — separator, unit spacing, `Math.round` on the ms stages, and `toFixed(1)` on the total — byte for byte.
 - **integer inputs render without decimals in the ms fields** — whole-number metrics pass through `Math.round` unchanged and the total still shows `.0`. *Why:* the common real-world case; guards against accidental decimal formatting on ms values.
 - **a typed question (sttFinalizeMs = 0) reads "finalized 0 ms"** — the ask-flow contract (`sttFinalizeMs: 0`) renders a plain `0 ms`. *Why:* every Ask-box answer will carry this exact value, so its rendering is now a fixed part of the UI.
+
+---
+
+## Practice-mode rework additions (2026-08-20)
+
+The practice-mode conversion (mock-interview coaching prompt, mic/system audio
+source, per-provider model picker, per-answer usage + cost reporting) added 37
+tests. Documented here, grouped by file.
+
+### test/prompt.test.ts (+2 net)
+
+- **always states the coach role and first-person instruction** *(reworded)* — the system prompt names the mock-interview coach role. *Why:* the prompt was rewritten from covert call-assistant to practice coach; this pins the new framing.
+- **frames the output as study material with a Key beats section** — the prompt demands the trailing `**Key beats**` bullets in every style. *Why:* the beats are the part the user memorises; a prompt edit that drops them guts the practice loop.
+- **shapes answers by question type instead of one behavioural mould** — behavioural / technical / motivation branches, plus the "technically correct" bar. *Why:* "what are React hooks?" answered like a STAR story is useless practice; the branch list is the quality contract.
+- **wraps the transcript and asks for the model answer** + **produces the exact wrapping format** *(reworded)* — the user turn is pinned byte-exactly to the new practice wording. *Why:* same as before — silent wording drift changes token counts and behaviour.
+
+### test/sse.test.ts (+6)
+
+- **surfaces the usage object from a final chunk** — `parseSSEChunk` returns `usage` alongside deltas. *Why:* the cost chip is fed from here; dropping the final chunk's accounting silently blanks it.
+- **omits the usage key entirely when no chunk carried one** — key-absence, not `undefined`. *Why:* callers compare whole results; a phantom key breaks exact assertions and JSON round-trips.
+- **reads Groq's x_groq mirror when the top-level usage is absent** — provider quirk cover. *Why:* Groq has shipped usage in both places across API versions.
+- **the last usage seen wins when several chunks carry one** — later chunks are cumulative. *Why:* summing would double-count.
+- **recovers usage from an unterminated tail line** — `parseSSETail` flushes usage exactly like it flushes the last delta. *Why:* the usage chunk is the *last* line, so it is the one most likely to arrive without a trailing newline.
+- **a non-object usage value is ignored** — hostile/malformed payload guard. *Why:* the parser's contract is "never crash the stream".
+
+### test/llm.test.ts (+7)
+
+- **anthropic: the default model sends NO thinking parameter** — Haiku 4.5 gets no `thinking` config. *Why:* Haiku never thinks unless asked; sending config it doesn't need risks 400s on API drift.
+- **anthropic: a model override reaches the body and disables default-on thinking** — Sonnet 5 / Opus 5 get `thinking: {type: 'disabled'}`. *Why:* those models think *by default*, and unprompted thinking spends the stop-to-first-word budget this app exists to protect.
+- **anthropic: reports usage with a cost estimate for a pinned-pricing model** — `onUsage` receives model, four token buckets, and a cost matching the pinned rates. *Why:* the whole model-comparison feature rests on these numbers being real.
+- **groq: asks for usage accounting on the final chunk** — `stream_options.include_usage` is sent. *Why:* without it Groq reports nothing and the chip never shows.
+- **groq: a non-reasoning model gets no reasoning params** — the llama pick omits `reasoning_effort`/`include_reasoning`. *Why:* non-reasoning models reject those params; the picker must not brick a model choice.
+- **groq: usage from the final chunk reaches onUsage — tokens only, no invented cost** — `estCostUsd` absent. *Why:* Groq pricing is deliberately not pinned; a guessed dollar figure is worse than none.
+- **groq: a stream with no usage chunk simply never calls onUsage** — absence is not an error. *Why:* usage is best-effort telemetry; its absence must never fail an answer.
+
+### test/session.test.ts (+3)
+
+- **usage reported by the provider lands on the done metrics** — recorded-session path. *Why:* the chip renders from `metrics.usage`; a broken thread loses the feature invisibly.
+- **ask() sessions carry usage too** — typed-question path. *Why:* Regenerate (the model-comparison gesture) goes through `ask()`.
+- **a provider that reports no usage produces metrics WITHOUT a usage key** — key-absence pinned. *Why:* `usage: undefined` survives `toEqual` but breaks key-iterating consumers; the conditional spread in session.ts is deliberate.
+
+### test/store.test.ts (+4)
+
+- **defaults: microphone source and the latency-first models** — new-install defaults. *Why:* the defaults ARE the product posture: practice partner in the room, fastest model.
+- **a settings.json written before these fields existed falls back to the defaults** — v2.0 files load clean. *Why:* the rework must not brick an existing settings file (which also holds the encrypted keys).
+- **patched values persist and reach getProfile** — round-trip through disk, and `getProfile` (which feeds provider construction) carries the model picks. *Why:* a picker that saves but doesn't reach the request is a silent lie.
+- **a model no longer in the curated list falls back instead of failing the file** — per-field `catch` semantics extended to the new enums. *Why:* retiring a model from the list in a future version must cost the user one dropdown value, not their resume.
+
+### test/format.test.ts (+8)
+
+- **empty when the provider reported no usage** — chip hides itself. *Why:* an empty chip rendering `"undefined"` is the classic formatter failure.
+- **shows dollars to four decimals when a cost estimate exists** / **four decimals keep sub-cent answers visible** — `$0.0030`, `$0.0004`. *Why:* two decimals would render every Haiku answer as `$0.00` and the comparison would teach nothing.
+- **falls back to a token count when pricing is not pinned (Groq)** — `1500→300 tok`. *Why:* honest fallback, pinned format.
+- **token fallback counts cached tokens as input** — cache reads/writes were real prompt tokens. *Why:* omitting them would understate counts if caching ever lands on that path.
+- **title names the model and the in/out split** — hover breakdown. *Why:* the chip is the headline; the title is where the comparison data lives.
+- **title mentions cache lines only when caching actually engaged** — zeros suppressed. *Why:* a wall of zeros buries the one number that matters (cache reads prove the prefix cache engaged — see README).
+- **title explains an absent estimate instead of leaving a bare token count** — "pricing not pinned". *Why:* an unexplained missing dollar figure reads as a bug.
+
+### test/pricing.test.ts (new file, 7)
+
+- **prices a typical Haiku answer (the default model) correctly** — 1500 in / 300 out = $0.003. *Why:* the README quotes this number; the code must agree with it.
+- **scales with the model tier** — $1/$3/$5 per MTok input across Haiku/Sonnet/Opus. *Why:* the tier ratio is the entire point of the comparison feature.
+- **output tokens are priced at the output rate** — 5x input on every tier. *Why:* swapping the rates is the likeliest single-character bug in a pricing table.
+- **cache reads bill at 0.1x input and writes at 1.25x** — Anthropic's uniform multipliers. *Why:* cache economics justify the two-block prompt; wrong multipliers misreport the payoff.
+- **all four buckets are summed — cache tokens are NOT inside inputTokens** — the API reports them separately. *Why:* double-counting or dropping either bucket skews every estimate silently.
+- **returns undefined for a model whose pricing is not pinned** — Groq and unknown ids. *Why:* "never guess" is the module's contract; the UI's token fallback depends on it.
+- **a zero-token answer costs exactly zero, not NaN** — degenerate input. *Why:* NaN in a template string renders `$NaN` in the chip.

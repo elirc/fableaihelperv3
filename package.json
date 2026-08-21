@@ -2,7 +2,7 @@
   "name": "ai-call-assistant",
   "productName": "AI Call Assistant",
   "version": "2.0.0",
-  "description": "Streams call audio to a live transcript and generates AI-suggested answers with sub-second latency.",
+  "description": "Mock-interview practice partner: transcribes a spoken practice question live and streams a model answer to rehearse against, with sub-second latency.",
   "main": "out/main/main.js",
   "author": "Owner",
   "license": "MIT",

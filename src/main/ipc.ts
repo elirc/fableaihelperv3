@@ -1,5 +1,6 @@
 import { BrowserWindow, ipcMain } from 'electron';
 import { z } from 'zod';
+import { ANTHROPIC_MODELS, GROQ_MODELS } from '../shared/types';
 import type { AppError, Result } from '../shared/types';
 import * as store from './store';
 import { SessionManager, toAppError, type LlmProvider, type SttStream } from './session';
@@ -14,6 +15,9 @@ const settingsPatchSchema = z
     jobDescription: z.string().max(200_000),
     alwaysOnTop: z.boolean(),
     llmProvider: z.enum(['anthropic', 'groq']),
+    anthropicModel: z.enum(ANTHROPIC_MODELS),
+    groqModel: z.enum(GROQ_MODELS),
+    audioSource: z.enum(['microphone', 'system']),
     answerStyle: z.enum(['brief', 'balanced', 'detailed']),
     // Electron accelerators are short; empty disables the shortcut.
     hotkey: z.string().max(100),
@@ -47,7 +51,7 @@ async function createStt(): Promise<SttStream> {
 }
 
 function createLlm(): LlmProvider {
-  const { resume, jobDescription, llmProvider, answerStyle } = store.getProfile();
+  const { resume, jobDescription, llmProvider, anthropicModel, groqModel, answerStyle } = store.getProfile();
   if (llmProvider === 'groq') {
     const key = store.getSecret('groqKey');
     if (!key) {
@@ -56,7 +60,7 @@ function createLlm(): LlmProvider {
         message: 'Groq API key is not set. Open Settings (gear icon) and add it, or switch the provider.',
       } satisfies AppError;
     }
-    return createGroqProvider(key, resume, jobDescription, answerStyle);
+    return createGroqProvider(key, resume, jobDescription, answerStyle, groqModel);
   }
   const key = store.getSecret('anthropicKey');
   if (!key) {
@@ -65,7 +69,7 @@ function createLlm(): LlmProvider {
       message: 'Anthropic API key is not set. Open Settings (gear icon) and add it.',
     } satisfies AppError;
   }
-  return createAnthropicProvider(key, resume, jobDescription, answerStyle);
+  return createAnthropicProvider(key, resume, jobDescription, answerStyle, anthropicModel);
 }
 
 /**

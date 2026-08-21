@@ -5,8 +5,23 @@
 // Feed each decoded chunk to parseSSEChunk together with whatever was left
 // over from the last call; it returns the content deltas found in the
 // *complete* lines and the trailing partial line to carry forward.
-export function parseSSEChunk(buffer: string): { deltas: string[]; rest: string } {
+
+/** Token accounting as OpenAI-compatible streams report it (final chunk, or Groq's x_groq envelope). */
+export interface SseUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+}
+
+export interface SseParseResult {
+  deltas: string[];
+  rest: string;
+  /** Present only when a parsed line carried a usage object; the last one seen wins. */
+  usage?: SseUsage;
+}
+
+export function parseSSEChunk(buffer: string): SseParseResult {
   const deltas: string[] = [];
+  let usage: SseUsage | undefined;
   let nl: number;
   while ((nl = buffer.indexOf('\n')) !== -1) {
     const line = buffer.slice(0, nl).trim(); // .trim() also drops the \r of CRLF
@@ -15,13 +30,20 @@ export function parseSSEChunk(buffer: string): { deltas: string[]; rest: string 
     const payload = line.slice(5).trim();
     if (payload === '[DONE]') continue;
     try {
-      const delta = JSON.parse(payload).choices?.[0]?.delta?.content;
+      const obj = JSON.parse(payload);
+      const delta = obj?.choices?.[0]?.delta?.content;
       if (delta) deltas.push(delta);
+      // Usage arrives on the final chunk when the request asked for it
+      // (stream_options.include_usage); Groq also mirrors it under x_groq.
+      const u = obj?.usage ?? obj?.x_groq?.usage;
+      if (u && typeof u === 'object') usage = u as SseUsage;
     } catch {
       // malformed/partial JSON — ignore this line rather than crash the stream
     }
   }
-  return { deltas, rest: buffer };
+  // Conditional so callers comparing the whole result don't see a usage key
+  // on streams that never reported one.
+  return usage ? { deltas, rest: buffer, usage } : { deltas, rest: buffer };
 }
 
 // End-of-stream flush for whatever parseSSEChunk handed back as `rest`.
@@ -32,11 +54,13 @@ export function parseSSEChunk(buffer: string): { deltas: string[]; rest: string 
 // final `data: {...}` without a trailing newline (a truncated or abruptly
 // closed response), that last line sits in `rest` forever and its delta is
 // silently lost — the user sees an answer missing its last few words with no
-// error. Call this once after the read loop ends.
+// error. Call this once after the read loop ends. The usage object rides the
+// same final line on some servers, so it is surfaced here too.
 //
 // Genuinely incomplete JSON still parses to nothing and is discarded, which is
 // the right outcome: there is no more data coming to complete it.
-export function parseSSETail(rest: string): string[] {
-  if (!rest.trim()) return [];
-  return parseSSEChunk(rest.endsWith('\n') ? rest : rest + '\n').deltas;
+export function parseSSETail(rest: string): { deltas: string[]; usage?: SseUsage } {
+  if (!rest.trim()) return { deltas: [] };
+  const { deltas, usage } = parseSSEChunk(rest.endsWith('\n') ? rest : rest + '\n');
+  return usage ? { deltas, usage } : { deltas };
 }

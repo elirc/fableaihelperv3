@@ -3,14 +3,23 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import {
+  ANTHROPIC_MODELS,
+  DEFAULT_ANTHROPIC_MODEL,
+  DEFAULT_GROQ_MODEL,
   DEFAULT_HOTKEY,
+  GROQ_MODELS,
   type AnswerStyle,
+  type AnthropicModelId,
+  type AudioSource,
+  type GroqModelId,
   type LlmProviderId,
   type SettingsPatch,
   type SettingsView,
 } from '../shared/types';
 
-// JSON settings store in %APPDATA%/AI Call Assistant/settings.json.
+// JSON settings store in %APPDATA%/AI Call Assistant/settings.json. The
+// directory keeps the v1 productName on purpose (see README): renaming it would
+// move userData and silently orphan the user's encrypted keys and profile.
 // Plain fields are stored as-is; API keys are encrypted with Electron
 // safeStorage (DPAPI on Windows) and stored base64 under `secrets`.
 // Keys are never returned to the renderer — SettingsView carries hasKey flags only.
@@ -20,6 +29,9 @@ interface StoreShape {
   jobDescription: string;
   alwaysOnTop: boolean;
   llmProvider: LlmProviderId;
+  anthropicModel: AnthropicModelId;
+  groqModel: GroqModelId;
+  audioSource: AudioSource;
   answerStyle: AnswerStyle;
   /** Electron accelerator; empty string means "no global shortcut". */
   hotkey: string;
@@ -35,6 +47,9 @@ function freshDefaults(): StoreShape {
     jobDescription: '',
     alwaysOnTop: true,
     llmProvider: 'anthropic',
+    anthropicModel: DEFAULT_ANTHROPIC_MODEL,
+    groqModel: DEFAULT_GROQ_MODEL,
+    audioSource: 'microphone',
     answerStyle: 'balanced',
     hotkey: DEFAULT_HOTKEY,
     secrets: {},
@@ -49,6 +64,11 @@ const persistedSchema = z.object({
   jobDescription: z.string().catch(''),
   alwaysOnTop: z.boolean().catch(true),
   llmProvider: z.enum(['anthropic', 'groq']).catch('anthropic'),
+  // Model picks fall back to the defaults rather than failing: an entry removed
+  // from the curated list in a future version must not brick the settings file.
+  anthropicModel: z.enum(ANTHROPIC_MODELS).catch(DEFAULT_ANTHROPIC_MODEL),
+  groqModel: z.enum(GROQ_MODELS).catch(DEFAULT_GROQ_MODEL),
+  audioSource: z.enum(['microphone', 'system']).catch('microphone'),
   answerStyle: z.enum(['brief', 'balanced', 'detailed']).catch('balanced'),
   hotkey: z.string().catch(DEFAULT_HOTKEY),
   secrets: z
@@ -86,6 +106,9 @@ function readFromDisk(): StoreShape {
     jobDescription: d.jobDescription,
     alwaysOnTop: d.alwaysOnTop,
     llmProvider: d.llmProvider,
+    anthropicModel: d.anthropicModel,
+    groqModel: d.groqModel,
+    audioSource: d.audioSource,
     answerStyle: d.answerStyle,
     hotkey: d.hotkey,
     // Copy: the cache must never share a reference with anything it did not build.
@@ -140,6 +163,9 @@ export function getSettingsView(): SettingsView {
     jobDescription: s.jobDescription,
     alwaysOnTop: s.alwaysOnTop,
     llmProvider: s.llmProvider,
+    anthropicModel: s.anthropicModel,
+    groqModel: s.groqModel,
+    audioSource: s.audioSource,
     answerStyle: s.answerStyle,
     hotkey: s.hotkey,
     hotkeyRegistered,
@@ -159,6 +185,9 @@ export function applySettingsPatch(patch: SettingsPatch): SettingsView {
   if (patch.jobDescription !== undefined) s.jobDescription = patch.jobDescription;
   if (patch.alwaysOnTop !== undefined) s.alwaysOnTop = patch.alwaysOnTop;
   if (patch.llmProvider !== undefined) s.llmProvider = patch.llmProvider;
+  if (patch.anthropicModel !== undefined) s.anthropicModel = patch.anthropicModel;
+  if (patch.groqModel !== undefined) s.groqModel = patch.groqModel;
+  if (patch.audioSource !== undefined) s.audioSource = patch.audioSource;
   if (patch.answerStyle !== undefined) s.answerStyle = patch.answerStyle;
   if (patch.hotkey !== undefined) s.hotkey = patch.hotkey.trim();
   for (const key of ['deepgramKey', 'anthropicKey', 'groqKey'] as const) {
@@ -183,6 +212,8 @@ export function getProfile(): {
   resume: string;
   jobDescription: string;
   llmProvider: LlmProviderId;
+  anthropicModel: AnthropicModelId;
+  groqModel: GroqModelId;
   answerStyle: AnswerStyle;
 } {
   const s = load();
@@ -190,6 +221,8 @@ export function getProfile(): {
     resume: s.resume,
     jobDescription: s.jobDescription,
     llmProvider: s.llmProvider,
+    anthropicModel: s.anthropicModel,
+    groqModel: s.groqModel,
     answerStyle: s.answerStyle,
   };
 }

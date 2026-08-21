@@ -5,10 +5,30 @@ import { buildSystemPrompt, buildSystemPromptBlocks, buildUserMessage } from '..
 const STYLES: AnswerStyle[] = ['brief', 'balanced', 'detailed'];
 
 describe('buildSystemPrompt', () => {
-  test('always states the assistant role and first-person instruction', () => {
+  test('always states the coach role and first-person instruction', () => {
     const p = buildSystemPrompt('', '', 'balanced');
-    expect(p).toMatch(/real-time call assistant/i);
+    expect(p).toMatch(/interview coach/i);
+    expect(p).toMatch(/mock interview/i);
     expect(p).toMatch(/first person/i);
+  });
+
+  test('frames the output as study material with a Key beats section', () => {
+    const p = buildSystemPrompt('', '', 'balanced');
+    expect(p).toMatch(/study material/i);
+    expect(p).toContain('**Key beats**');
+    // The Key beats section must survive every style, including brief — the
+    // style rule is scoped to the spoken answer only.
+    expect(p).toMatch(/Key beats section is always present/i);
+  });
+
+  test('shapes answers by question type instead of one behavioural mould', () => {
+    const p = buildSystemPrompt('', '', 'balanced');
+    expect(p).toMatch(/Behavioural/);
+    expect(p).toMatch(/Technical or knowledge/);
+    expect(p).toMatch(/Motivation/);
+    // Wrong technical answers are worse than short ones — pinned because it is
+    // the quality bar the whole practice loop depends on.
+    expect(p).toMatch(/technically correct/i);
   });
 
   test('omits resume/JD sections and grounding clause when profile is empty', () => {
@@ -146,17 +166,17 @@ describe('answerStyle', () => {
 });
 
 describe('buildUserMessage', () => {
-  test('wraps the transcript and asks what to say', () => {
+  test('wraps the transcript and asks for the model answer', () => {
     const m = buildUserMessage('Tell me about yourself.');
     expect(m).toContain('Tell me about yourself.');
-    expect(m).toMatch(/What should I say\?/);
+    expect(m).toMatch(/Write the model answer\./);
   });
 
   // Pinned exactly: the user turn is part of every request, and any accidental
   // wording drift here would change token counts and model behaviour silently.
   test('produces the exact wrapping format', () => {
     expect(buildUserMessage('Why Go?')).toBe(
-      'The other person on the call just said:\n"""\nWhy Go?\n"""\n\nWhat should I say?',
+      'My practice partner just asked:\n"""\nWhy Go?\n"""\n\nWrite the model answer.',
     );
   });
 
