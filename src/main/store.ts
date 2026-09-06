@@ -27,6 +27,8 @@ import {
 interface StoreShape {
   resume: string;
   jobDescription: string;
+  personalProfile: string;
+  customInstructions: string;
   alwaysOnTop: boolean;
   llmProvider: LlmProviderId;
   anthropicModel: AnthropicModelId;
@@ -45,12 +47,14 @@ function freshDefaults(): StoreShape {
   return {
     resume: '',
     jobDescription: '',
+    personalProfile: '',
+    customInstructions: '',
     alwaysOnTop: true,
     llmProvider: 'anthropic',
     anthropicModel: DEFAULT_ANTHROPIC_MODEL,
     groqModel: DEFAULT_GROQ_MODEL,
     audioSource: 'microphone',
-    answerStyle: 'balanced',
+    answerStyle: 'brief',
     hotkey: DEFAULT_HOTKEY,
     secrets: {},
   };
@@ -62,6 +66,8 @@ function freshDefaults(): StoreShape {
 const persistedSchema = z.object({
   resume: z.string().catch(''),
   jobDescription: z.string().catch(''),
+  personalProfile: z.string().max(12_000).catch(''),
+  customInstructions: z.string().max(8_000).catch(''),
   alwaysOnTop: z.boolean().catch(true),
   llmProvider: z.enum(['anthropic', 'groq']).catch('anthropic'),
   // Model picks fall back to the defaults rather than failing: an entry removed
@@ -69,7 +75,7 @@ const persistedSchema = z.object({
   anthropicModel: z.enum(ANTHROPIC_MODELS).catch(DEFAULT_ANTHROPIC_MODEL),
   groqModel: z.enum(GROQ_MODELS).catch(DEFAULT_GROQ_MODEL),
   audioSource: z.enum(['microphone', 'system']).catch('microphone'),
-  answerStyle: z.enum(['brief', 'balanced', 'detailed']).catch('balanced'),
+  answerStyle: z.enum(['brief', 'balanced', 'detailed']).catch('brief'),
   hotkey: z.string().catch(DEFAULT_HOTKEY),
   secrets: z
     .object({
@@ -104,6 +110,8 @@ function readFromDisk(): StoreShape {
   return {
     resume: d.resume,
     jobDescription: d.jobDescription,
+    personalProfile: d.personalProfile,
+    customInstructions: d.customInstructions,
     alwaysOnTop: d.alwaysOnTop,
     llmProvider: d.llmProvider,
     anthropicModel: d.anthropicModel,
@@ -161,6 +169,8 @@ export function getSettingsView(): SettingsView {
   return {
     resume: s.resume,
     jobDescription: s.jobDescription,
+    personalProfile: s.personalProfile,
+    customInstructions: s.customInstructions,
     alwaysOnTop: s.alwaysOnTop,
     llmProvider: s.llmProvider,
     anthropicModel: s.anthropicModel,
@@ -183,6 +193,8 @@ export function applySettingsPatch(patch: SettingsPatch): SettingsView {
   const s: StoreShape = { ...cur, secrets: { ...cur.secrets } };
   if (patch.resume !== undefined) s.resume = patch.resume;
   if (patch.jobDescription !== undefined) s.jobDescription = patch.jobDescription;
+  if (patch.personalProfile !== undefined) s.personalProfile = patch.personalProfile;
+  if (patch.customInstructions !== undefined) s.customInstructions = patch.customInstructions;
   if (patch.alwaysOnTop !== undefined) s.alwaysOnTop = patch.alwaysOnTop;
   if (patch.llmProvider !== undefined) s.llmProvider = patch.llmProvider;
   if (patch.anthropicModel !== undefined) s.anthropicModel = patch.anthropicModel;
@@ -211,6 +223,8 @@ export function getSecret(key: 'deepgramKey' | 'anthropicKey' | 'groqKey'): stri
 export function getProfile(): {
   resume: string;
   jobDescription: string;
+  personalProfile: string;
+  customInstructions: string;
   llmProvider: LlmProviderId;
   anthropicModel: AnthropicModelId;
   groqModel: GroqModelId;
@@ -220,6 +234,8 @@ export function getProfile(): {
   return {
     resume: s.resume,
     jobDescription: s.jobDescription,
+    personalProfile: s.personalProfile,
+    customInstructions: s.customInstructions,
     llmProvider: s.llmProvider,
     anthropicModel: s.anthropicModel,
     groqModel: s.groqModel,

@@ -13,6 +13,8 @@ const settingsPatchSchema = z
   .object({
     resume: z.string().max(200_000),
     jobDescription: z.string().max(200_000),
+    personalProfile: z.string().max(12_000),
+    customInstructions: z.string().max(8_000),
     alwaysOnTop: z.boolean(),
     llmProvider: z.enum(['anthropic', 'groq']),
     anthropicModel: z.enum(ANTHROPIC_MODELS),
@@ -31,6 +33,13 @@ const sessionIdSchema = z.number().int().positive();
 // A typed question: non-empty once trimmed, and bounded so a paste accident
 // cannot ship a novel to the LLM.
 const askTextSchema = z.string().trim().min(1).max(8_000);
+const askOptionsSchema = z.object({
+  context: z.array(z.object({
+    question: z.string().trim().min(1).max(20_000),
+    answer: z.string().trim().min(1).max(20_000),
+  })).max(6).optional(),
+  answerStyle: z.enum(['brief', 'balanced', 'detailed']).optional(),
+}).optional();
 
 function ok<T>(value: T): Result<T> {
   return { ok: true, value };
@@ -51,7 +60,8 @@ async function createStt(): Promise<SttStream> {
 }
 
 function createLlm(): LlmProvider {
-  const { resume, jobDescription, llmProvider, anthropicModel, groqModel, answerStyle } = store.getProfile();
+  const { resume, jobDescription, personalProfile, customInstructions, llmProvider, anthropicModel, groqModel, answerStyle } = store.getProfile();
+  const personalization = { personalProfile, customInstructions };
   if (llmProvider === 'groq') {
     const key = store.getSecret('groqKey');
     if (!key) {
@@ -60,7 +70,7 @@ function createLlm(): LlmProvider {
         message: 'Groq API key is not set. Open Settings (gear icon) and add it, or switch the provider.',
       } satisfies AppError;
     }
-    return createGroqProvider(key, resume, jobDescription, answerStyle, groqModel);
+    return createGroqProvider(key, resume, jobDescription, answerStyle, groqModel, personalization);
   }
   const key = store.getSecret('anthropicKey');
   if (!key) {
@@ -69,7 +79,7 @@ function createLlm(): LlmProvider {
       message: 'Anthropic API key is not set. Open Settings (gear icon) and add it.',
     } satisfies AppError;
   }
-  return createAnthropicProvider(key, resume, jobDescription, answerStyle, anthropicModel);
+  return createAnthropicProvider(key, resume, jobDescription, answerStyle, anthropicModel, personalization);
 }
 
 /**
@@ -121,13 +131,14 @@ export function registerIpc(getWin: () => BrowserWindow | null, applyHotkey: () 
     }
   });
 
-  ipcMain.handle('session:ask', async (_e, raw): Promise<Result<number>> => {
+  ipcMain.handle('session:ask', async (_e, raw, rawOptions): Promise<Result<number>> => {
     // Typed questions skip STT entirely, so the LLM handshake is the whole
     // pre-answer critical path — start it before the session even spins up.
     warmLlmConnection(store.getProfile().llmProvider);
     try {
       const text = askTextSchema.parse(raw);
-      return ok(await sessions.ask(text));
+      const options = askOptionsSchema.parse(rawOptions);
+      return ok(await sessions.ask(text, options));
     } catch (err) {
       return fail(toAppError(err, 'internal'));
     }

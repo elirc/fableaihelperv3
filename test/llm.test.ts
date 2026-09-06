@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import type { AppError } from '../src/shared/types';
 import { createAnthropicProvider } from '../src/main/llm/anthropic';
 import { createGroqProvider } from '../src/main/llm/groq';
+import { buildSystemPrompt, buildSystemPromptBlocks } from '../src/main/prompt';
 
 // These tests stub global fetch rather than mocking the Anthropic SDK, so the
 // real SDK does the real work: it parses the real SSE wire format and throws its
@@ -122,6 +123,35 @@ describe('anthropic provider — happy path', () => {
     // part of the cached prefix and toggling it would bust the cache.
     expect(body.system[1].cache_control).toBeUndefined();
     expect(body.model).toBe('claude-haiku-4-5');
+  });
+
+  test('sends personalization and follow-up context while keeping style outside the cached prefix', async () => {
+    const fetchMock = vi.fn(async (..._args: FetchArgs) => anthropicStream([['Example']]));
+    vi.stubGlobal('fetch', fetchMock);
+    const personalization = { personalProfile: 'I write Python APIs.', customInstructions: 'Use backend examples.' };
+    const provider = createAnthropicProvider('sk-test', 'resume', 'jd', 'brief', 'claude-haiku-4-5', personalization);
+    await provider.generate('Show a Python example.', noop, new AbortController().signal, undefined, {
+      answerStyle: 'detailed',
+      context: [{ question: 'Explain caching.', answer: 'Reuse a stored result.' }],
+    });
+    const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    const expected = buildSystemPromptBlocks('resume', 'jd', 'detailed', personalization);
+    expect(body.system[0]).toMatchObject({ text: expected.cachedPrefix, cache_control: { type: 'ephemeral' } });
+    expect(body.system[0].text).toContain(personalization.personalProfile);
+    expect(body.system[0].text).toContain(personalization.customInstructions);
+    expect(body.system[1]).toEqual({ type: 'text', text: expected.styleSuffix });
+    expect(body.messages.map((m: { role: string }) => m.role)).toEqual(['user', 'assistant', 'user']);
+    expect(body.messages[0].content).toContain('Explain caching.');
+    expect(body.messages[1].content).toBe('Reuse a stored result.');
+    expect(body.messages[2].content).toContain('Show a Python example.');
+    expect(body.max_tokens).toBe(2048);
+
+    await provider.generate('Next question', noop, new AbortController().signal);
+    const nextBody = JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit).body));
+    expect(nextBody.system[0]).toEqual(body.system[0]);
+    expect(nextBody.system[1].text).toBe(buildSystemPromptBlocks('resume', 'jd', 'brief', personalization).styleSuffix);
+    expect(nextBody.messages).toHaveLength(1);
+    expect(nextBody.max_tokens).toBe(1024);
   });
 });
 
@@ -358,30 +388,104 @@ describe('groq provider', () => {
     expect(full).toBe('Start END');
   });
 
-  test('pins the model to a non-deprecated id and suppresses reasoning for latency', async () => {
+  test('uses the default public model and suppresses reasoning for latency', async () => {
     const fetchMock = vi.fn(async (..._args: FetchArgs) => groqStream(groqLine('x') + 'data: [DONE]\n\n'));
     vi.stubGlobal('fetch', fetchMock);
     await groq().generate('q', noop, new AbortController().signal);
 
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
     const body = JSON.parse(String(init.body));
-    expect(body.model).not.toBe('llama-3.3-70b-versatile'); // shut down 2026-08-16
     expect(body.model).toBe('openai/gpt-oss-120b');
     expect(body.include_reasoning).toBe(false);
     expect(body.reasoning_effort).toBe('low');
     expect(body.stream).toBe(true);
   });
 
-  // Parity with anthropic.ts's MAX_TOKENS: spoken answers are short, and an
-  // uncapped runaway completion is pure tail latency.
-  test('caps the completion length so a runaway answer cannot stream forever', async () => {
+  test('caps completion length with room for hidden reasoning and visible answer text', async () => {
     const fetchMock = vi.fn(async (..._args: FetchArgs) => groqStream(groqLine('x') + 'data: [DONE]\n\n'));
     vi.stubGlobal('fetch', fetchMock);
     await groq().generate('q', noop, new AbortController().signal);
 
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
     const body = JSON.parse(String(init.body));
-    expect(body.max_completion_tokens).toBe(1024);
+    expect(body.max_completion_tokens).toBe(2048);
+  });
+
+  test('sends personalization and real conversation turns for a detailed follow-up', async () => {
+    const fetchMock = vi.fn(async (..._args: FetchArgs) => groqStream(groqLine('x') + 'data: [DONE]\n\n'));
+    vi.stubGlobal('fetch', fetchMock);
+    const personalization = { personalProfile: 'I build Python APIs.', customInstructions: 'Use practical backend examples.' };
+    const provider = createGroqProvider('gsk-test', 'resume', 'jd', 'brief', 'openai/gpt-oss-120b', personalization);
+    await provider.generate('Show an example.', noop, new AbortController().signal, undefined, {
+      answerStyle: 'detailed',
+      context: [{ question: 'What is idempotency?', answer: 'Repeated requests have the same effect.' }],
+    });
+    const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body.messages.map((m: { role: string }) => m.role)).toEqual(['system', 'user', 'assistant', 'user']);
+    expect(body.messages[0].content).toBe(buildSystemPrompt('resume', 'jd', 'detailed', personalization));
+    expect(body.messages[0].content).toContain(personalization.personalProfile);
+    expect(body.messages[0].content).toContain(personalization.customInstructions);
+    expect(body.messages[1].content).toContain('What is idempotency?');
+    expect(body.messages[2].content).toBe('Repeated requests have the same effect.');
+    expect(body.messages[3].content).toContain('Show an example.');
+    expect(body.max_completion_tokens).toBe(4096);
+
+    // A request-specific expansion must not turn later initial answers detailed.
+    await provider.generate('Next question', noop, new AbortController().signal);
+    const nextBody = JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit).body));
+    expect(nextBody.messages[0].content).toBe(buildSystemPrompt('resume', 'jd', 'brief', personalization));
+    expect(nextBody.messages).toHaveLength(2);
+    expect(nextBody.max_completion_tokens).toBe(2048);
+  });
+
+  test.each(['', 'data: [DONE]\n\n', 'data: {not json}\n\n', groqLine('   ')])(
+    'rejects an HTTP 200 stream without answer text (%j)', async (body) => {
+      vi.stubGlobal('fetch', vi.fn(async () => groqStream(body)));
+      const err = await catchError(() => groq().generate('q', noop, new AbortController().signal));
+      expect(err.code).toBe('llm_http');
+      expect(err.message).toMatch(/no answer text/i);
+    },
+  );
+
+  test.each(['\n\n', ''])('surfaces an SSE error after partial text with ending %j', async (ending) => {
+    const body = groqLine('Partial answer') + 'data: {"error":{"message":"Generation failed","code":"server_error"}}' + ending;
+    const fetchMock = vi.fn(async () => groqStream(body));
+    vi.stubGlobal('fetch', fetchMock);
+    const deltas: string[] = [];
+    const err = await catchError(() => groq().generate('q', (d) => deltas.push(d), new AbortController().signal));
+    expect(err).toMatchObject({ code: 'llm_http', message: expect.stringContaining('Generation failed') });
+    expect(deltas).toEqual(['Partial answer']);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('maps a rate-limit event received after HTTP 200', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => groqStream('data: {"error":{"code":"rate_limit_exceeded"}}\n\n')));
+    const err = await catchError(() => groq().generate('q', noop, new AbortController().signal));
+    expect(err.code).toBe('llm_rate_limit');
+  });
+
+  test('gives a typed follow-up room for examples even when the saved style is brief', async () => {
+    const fetchMock = vi.fn(async (..._args: FetchArgs) => groqStream(groqLine('Example') + 'data: [DONE]\n\n'));
+    vi.stubGlobal('fetch', fetchMock);
+    await createGroqProvider('gsk-test', '', '', 'brief').generate(
+      'Show me a Python example.', noop, new AbortController().signal, undefined,
+      { context: [{ question: 'Explain caching.', answer: 'Store reusable results.' }] },
+    );
+    const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body.max_completion_tokens).toBe(4096);
+    expect(body.messages[3].content).toContain('Show me a Python example.');
+  });
+
+  test('finishes on DONE without waiting for the server to close the connection', async () => {
+    const cancel = vi.fn();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(groqLine('Complete') + 'data: [DONE]\n\n'));
+      },
+      cancel,
+    }), { headers: { 'content-type': 'text/event-stream' } })));
+    expect(await groq().generate('q', noop, new AbortController().signal)).toBe('Complete');
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
   // Our TextDecoder path, not the parser's: decode(value, {stream: true}) must
@@ -426,6 +530,8 @@ describe('groq provider', () => {
     expect(err.code).toBe('llm_auth');
     expect(err.message).toContain('403');
     expect(err.message).not.toContain('401');
+    expect(err.message).toContain('openai/gpt-oss-120b');
+    expect(err.message).toMatch(/permissions/);
   });
 
   test('429 maps to llm_rate_limit', async () => {

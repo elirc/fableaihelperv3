@@ -10,6 +10,7 @@
     "build": "tsc -p tsconfig.main.json && vite build",
     "start": "npm run build && electron .",
     "test": "vitest run",
+    "test:smoke": "npm run build && node scripts/smoke-groq.cjs",
     "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
     "dist": "npm run build && electron-builder --win"
   },

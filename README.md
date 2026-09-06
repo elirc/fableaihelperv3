@@ -12,6 +12,27 @@ sub-second engineering, pointed at rehearsal. Each answer ends with a
 **Key beats** section — the two to four points worth memorising — because the
 prose is what good sounds like, and the beats are what you actually keep.
 
+## Personalize answers and follow up
+
+Open **Settings** and fill in **Personal profile** with your role, experience,
+goals, and preferred examples. Use **System prompt customization** for your own
+instructions about tone, focus, answer structure, or code language. These are
+saved alongside your resume and target job, and apply to future answers from
+both providers. Custom instructions can override the default coaching format.
+
+New profiles default to **Concise first**: a short direct answer with compact
+Key beats. Existing saved style choices are preserved. After an answer, use
+**Go deeper** for reasoning and tradeoffs or **Show an example** for a worked
+example. These expand just that answer without changing your saved default.
+Explicit requests for depth are honored even in concise mode.
+
+Choose **Follow up** to type a request about the answer you are viewing, or
+**New question** to start fresh. Follow-ups use actual prior question/answer
+turns, including when you branch from history. Context is bounded to the
+original exchange plus the five most recent exchanges. History and conversation
+context stay in memory for the current app run. Regenerate preserves a
+follow-up's context and temporary depth setting.
+
 ## How a practice round works
 
 ```
@@ -76,8 +97,9 @@ latency/cost/quality trade — measured, not guessed.
   playback doesn't leak into the question.
 - **Global hotkey** toggles record/stop from any app. Default
   `CommandOrControl+Shift+Space`, editable in Settings, empty to disable.
-- **Ask box** — type a question and get a streamed model answer without
-  recording: same pipeline, same metrics, STT stage at 0 ms.
+- **Ask box** — type a new question or a contextual follow-up without
+  recording: same pipeline, same metrics, STT stage at 0 ms. Only the answer
+  provider's key is required; Deepgram is optional for typed questions.
 - **Regenerate** — re-asks the viewed question as a fresh answer (new history
   entry), so comparing two models on the same question costs two clicks:
   switch model in Settings, press Regenerate.
@@ -107,12 +129,12 @@ npm install
 npm start        # build + launch
 ```
 
-First run: open Settings (gear icon) and add
+First run: open Settings (gear icon), pick **Groq** or **Anthropic**, and add
+that provider's API key. You can immediately use the Ask box. Add your personal
+profile, custom instructions, resume, and job description as useful context.
+Add a **Deepgram** key only if you want live recording/transcription.
 
-1. a **Deepgram** API key (console.deepgram.com — free credit tier),
-2. an **Anthropic** API key (platform.claude.com) — or a Groq key if you pick
-   the Groq provider,
-3. your resume and the job description (plain text).
+For the complete manual acceptance run, follow [Final test checklist](docs/FINAL_TEST.md).
 
 Keys are stored encrypted per-machine and can be replaced but never read back.
 Windows will ask for microphone permission on the first recording.
@@ -123,6 +145,7 @@ Windows will ask for microphone permission on the first recording.
 |---|---|
 | `npm start` | Build everything and launch Electron |
 | `npm test` | Vitest suite (see `docs/TESTING.md`) |
+| `npm run test:smoke` | Build and exercise Electron with simulated Groq streaming, no API key or network |
 | `npm run typecheck` | Strict TS across main + renderer |
 | `npm run dist` | Windows NSIS installer via electron-builder |
 
@@ -144,7 +167,7 @@ src/
     llm/anthropic.ts  model from Settings, two-block cached system prompt,
                       usage + cost reporting, thinking disabled on Sonnet/Opus
     llm/groq.ts       OpenAI-compatible SSE streaming, usage accounting,
-                      reasoning suppressed on gpt-oss, 1024-token cap
+                      hidden reasoning, 2048-token cap (4096 for depth/follow-ups)
     llm/pricing.ts    pinned Anthropic pricing + cost estimator (never guesses)
     llm/warm.ts   throttled fire-and-forget TLS pre-warm of the provider origin
     prompt.ts     mock-interview coach prompt, split at the cache breakpoint

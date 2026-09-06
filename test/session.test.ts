@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import type { AnswerMetrics, AppError } from '../src/shared/types';
+import type { AnswerMetrics, AppError, AskOptions } from '../src/shared/types';
 import {
   SessionManager,
   toAppError,
@@ -76,6 +76,36 @@ function collectEvents() {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+describe('contextual follow-ups', () => {
+  test('passes a snapshot of context and per-answer style without leaking into later questions', async () => {
+    const { events, log } = collectEvents();
+    const requests: Array<AskOptions | undefined> = [];
+    const manager = new SessionManager({
+      createStt: async () => new FakeStt(),
+      createLlm: () => ({
+        async generate(_question, onDelta, _signal, _usage, options) {
+          requests.push(options);
+          onDelta('An explanation.');
+          return 'An explanation.';
+        },
+      }),
+      events,
+    });
+    const options: AskOptions = { context: [{ question: 'What is a cache?', answer: 'A store for reused results.' }], answerStyle: 'detailed' };
+    await manager.ask('Show an example.', options);
+    options.context![0]!.answer = 'Changed after asking';
+    options.answerStyle = 'brief';
+    await until(() => log.some((event) => event.type === 'done'));
+    expect(requests[0]).toEqual({ context: [{ question: 'What is a cache?', answer: 'A store for reused results.' }], answerStyle: 'detailed' });
+    await manager.ask('A separate question');
+    await until(() => log.filter((event) => event.type === 'done').length === 2);
+    expect(requests[1]).toBeUndefined();
+    const id = await manager.start();
+    await manager.stop(id);
+    expect(requests[2]).toBeUndefined();
+  });
+});
 
 /**
  * Poll until cond() holds. ask() resolves before its pipeline runs (the answer

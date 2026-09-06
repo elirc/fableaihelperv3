@@ -6,6 +6,18 @@ export type LlmProviderId = 'anthropic' | 'groq';
 /** How long an answer should be. Feeds the system prompt; does not change the cached prefix shape. */
 export type AnswerStyle = 'brief' | 'balanced' | 'detailed';
 
+/** A completed exchange included when continuing a specific answer. */
+export interface ConversationTurn {
+  question: string;
+  answer: string;
+}
+
+/** Per-request context and length override; never changes saved preferences. */
+export interface AskOptions {
+  context?: ConversationTurn[];
+  answerStyle?: AnswerStyle;
+}
+
 /**
  * Where the practice question's audio comes from.
  *  - 'microphone': a practice partner asking questions in the room (default).
@@ -34,6 +46,8 @@ export const DEFAULT_HOTKEY = 'CommandOrControl+Shift+Space';
 export interface SettingsView {
   resume: string;
   jobDescription: string;
+  personalProfile: string;
+  customInstructions: string;
   alwaysOnTop: boolean;
   llmProvider: LlmProviderId;
   anthropicModel: AnthropicModelId;
@@ -53,6 +67,8 @@ export interface SettingsView {
 export interface SettingsPatch {
   resume?: string;
   jobDescription?: string;
+  personalProfile?: string;
+  customInstructions?: string;
   alwaysOnTop?: boolean;
   llmProvider?: LlmProviderId;
   anthropicModel?: AnthropicModelId;
@@ -152,7 +168,7 @@ export interface RendererApi {
    * the same event stream as a recorded session: one final stt:partial
    * carrying the question text, llm:delta per token, llm:done / session:error.
    */
-  askQuestion(text: string): Promise<Result<number>>;
+  askQuestion(text: string, options?: AskOptions): Promise<Result<number>>;
   sendAudio(sessionId: number, pcm: ArrayBuffer): void;
   stopSession(sessionId: number): Promise<Result<null>>;
   cancelSession(sessionId: number): Promise<void>;

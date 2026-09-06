@@ -227,7 +227,12 @@ main, #settingsView {
 
 /* ---------- Ask box (typed-question fallback) ---------- */
 .ask-row { display: flex; align-items: center; gap: 8px; flex: none; }
-.ask-row input { flex: 1; padding: 7px 10px; }
+.ask-row input { flex: 1; min-width: 0; padding: 7px 10px; }
+.ask-mode { display: flex; align-items: center; gap: 6px; flex: none; }
+.ask-mode .chip { flex: none; }
+.ask-mode-hint, .style-hint { margin-top: -5px; flex: none; overflow-wrap: anywhere; }
+.followup-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 12px 10px; border-top: 1px solid var(--border); flex: none; }
+.followup-actions .ask-btn { font-size: 12px; padding: 5px 10px; }
 .ask-btn {
   flex: none;
   padding: 7px 14px;
@@ -245,7 +250,8 @@ main, #settingsView {
   background: none; border: 1px solid var(--border); border-radius: 999px;
   color: var(--muted); font-size: 12px; padding: 4px 10px; cursor: pointer;
 }
-.chip:hover:not([aria-pressed="true"]) { color: var(--text); border-color: var(--muted); }
+.chip:hover:not(:disabled):not([aria-pressed="true"]) { color: var(--text); border-color: var(--muted); }
+.chip:disabled { opacity: 0.55; cursor: default; }
 /* Selected fill picked for AA: white on this blue is >10:1, and the border
    uses --blue (~5:1 on the page background) so the state reads without color. */
 .chip[aria-pressed="true"] {

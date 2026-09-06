@@ -1,5 +1,5 @@
 import { performance } from 'node:perf_hooks';
-import type { AnswerMetrics, AnswerUsage, AppError } from '../shared/types';
+import type { AnswerMetrics, AnswerUsage, AppError, AskOptions } from '../shared/types';
 
 // One live question/answer pipeline. The manager owns exactly one active
 // session; starting a new one aborts the old, which is what makes
@@ -32,6 +32,7 @@ export interface LlmProvider {
     onDelta: (delta: string) => void,
     signal: AbortSignal,
     onUsage?: (usage: AnswerUsage) => void,
+    options?: AskOptions,
   ): Promise<string>;
 }
 
@@ -132,7 +133,7 @@ export class SessionManager {
    * onLlmDelta per token, and onLlmDone (or onError). Metrics are measured from
    * this call, with sttFinalizeMs pinned to 0 since nothing was finalized.
    */
-  async ask(text: string): Promise<number> {
+  async ask(text: string, options?: AskOptions): Promise<number> {
     // The latency clock starts the moment the user submits the question.
     const t0 = performance.now();
     const trimmed = text.trim();
@@ -157,11 +158,15 @@ export class SessionManager {
     this.active = s;
     // Deferred a tick so the caller holds the session id before the first
     // event lands — mirrors start(), where events can only follow resolution.
-    setImmediate(() => void this.runAsk(s, trimmed, t0));
+    const requestOptions = options ? {
+      ...options,
+      ...(options.context ? { context: options.context.map((turn) => ({ ...turn })) } : {}),
+    } : undefined;
+    setImmediate(() => void this.runAsk(s, trimmed, t0, requestOptions));
     return id;
   }
 
-  private async runAsk(s: ActiveSession, transcript: string, t0: number): Promise<void> {
+  private async runAsk(s: ActiveSession, transcript: string, t0: number, options?: AskOptions): Promise<void> {
     const sessionId = s.id;
     const since = () => Math.round(performance.now() - t0);
     let firstTokenMs: number | null = null;
@@ -173,7 +178,7 @@ export class SessionManager {
       const llm = this.deps.createLlm();
       const { answer, usage } = await this.runLlm(s, transcript, llm, () => {
         firstTokenMs = since();
-      });
+      }, options);
       if (this.isStale(sessionId)) return;
       const totalMs = since();
       this.deps.events.onLlmDone(sessionId, transcript, answer, {
@@ -295,6 +300,7 @@ export class SessionManager {
     transcript: string,
     llm: LlmProvider,
     onFirstToken: () => void,
+    options?: AskOptions,
   ): Promise<{ answer: string; usage?: AnswerUsage }> {
     const { signal } = s.abort;
     let gotFirstToken = false;
@@ -340,6 +346,7 @@ export class SessionManager {
           (u) => {
             usage = u;
           },
+          options,
         )
         .then((full) => {
           if (settled) return;

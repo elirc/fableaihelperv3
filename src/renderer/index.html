@@ -33,18 +33,24 @@
       <div class="timer" id="timer" aria-hidden="true"></div>
     </div>
 
+    <div class="ask-mode" role="group" aria-label="Question mode">
+      <button id="newQuestionBtn" class="chip" type="button" aria-pressed="true">New question</button>
+      <button id="followupModeBtn" class="chip" type="button" aria-pressed="false" disabled>Follow up</button>
+    </div>
     <form id="askForm" class="ask-row">
       <label class="sr-only" for="askInput">Type a question</label>
-      <input type="text" id="askInput" placeholder="Or type a practice question here…" autocomplete="off" spellcheck="false" />
+      <input type="text" id="askInput" placeholder="Or type a practice question here…" autocomplete="off" spellcheck="false" aria-describedby="askModeHint" />
       <button id="askBtn" class="ask-btn" type="submit">Ask</button>
     </form>
+    <p id="askModeHint" class="hint ask-mode-hint">New question · use Follow up to continue the answer you are viewing.</p>
 
     <div class="style-row" role="group" aria-label="Answer style">
       <span class="style-label" aria-hidden="true">Style</span>
-      <button id="styleBrief" class="chip" type="button" data-style="brief" aria-pressed="false">Brief</button>
+      <button id="styleBrief" class="chip" type="button" data-style="brief" aria-pressed="false">Concise first</button>
       <button id="styleBalanced" class="chip" type="button" data-style="balanced" aria-pressed="false">Balanced</button>
       <button id="styleDetailed" class="chip" type="button" data-style="detailed" aria-pressed="false">Detailed</button>
     </div>
+    <p class="hint style-hint">Start concise. Go deeper or ask for an example whenever you need more.</p>
 
     <section class="panel" aria-labelledby="transcriptTitle">
       <div class="panel-title">
@@ -72,6 +78,10 @@
         </div>
       </div>
       <div class="panel-body md" id="answerBox" aria-live="polite" aria-atomic="false" tabindex="0"><span class="placeholder">The model answer to practise against will stream here.</span></div>
+      <div class="followup-actions" role="group" aria-label="Explore this answer">
+        <button id="deeperBtn" class="ask-btn" type="button" disabled>Go deeper</button>
+        <button id="exampleBtn" class="ask-btn" type="button" disabled>Show an example</button>
+      </div>
     </section>
 
     <div class="error" id="errorBox" role="alert" hidden></div>
@@ -108,7 +118,7 @@
     <select id="groqModel">
       <option value="openai/gpt-oss-120b">GPT-OSS 120B — default, ~500 tok/s</option>
       <option value="openai/gpt-oss-20b">GPT-OSS 20B — smaller, faster</option>
-      <option value="llama-3.1-8b-instant">Llama 3.1 8B Instant — cheapest</option>
+      <option value="llama-3.1-8b-instant">Llama 3.1 8B Instant — Enterprise access</option>
     </select>
 
     <label for="anthropicKey">Anthropic API key <span class="hint"><a href="https://platform.claude.com/" target="_blank" rel="noreferrer">get one</a></span></label>
@@ -117,12 +127,21 @@
     <label for="groqKey">Groq API key <span class="hint">(only for the Groq provider) — <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer">get one</a></span></label>
     <input type="password" id="groqKey" autocomplete="off" />
 
-    <label for="answerStyle">Answer style</label>
+    <label for="answerStyle">Default answer style</label>
     <select id="answerStyle">
-      <option value="brief">Brief — a few sentences, fastest to read</option>
+      <option value="brief">Concise first — a short answer, more on request (default)</option>
       <option value="balanced">Balanced — a short structured answer</option>
       <option value="detailed">Detailed — fuller answer with specifics</option>
     </select>
+    <p class="hint">Go deeper and Show an example expand one answer without changing this default.</p>
+
+    <label for="personalProfile">Personal profile</label>
+    <textarea id="personalProfile" rows="5" maxlength="12000" aria-describedby="profileHelp" placeholder="Role: junior backend developer. Experience: 2 years with Python. Goal: prepare for senior interviews. I learn best from practical API examples."></textarea>
+    <p class="hint" id="profileHelp">Share your role, experience level, goals, and preferred examples to make answers more relevant. Up to 12,000 characters.</p>
+
+    <label for="customInstructions">System prompt customization</label>
+    <textarea id="customInstructions" rows="5" maxlength="8000" aria-describedby="instructionsHelp" placeholder="Use a direct, friendly tone. Lead with the answer, then explain why. Emphasize tradeoffs. Use Python for code examples. When I ask for more detail, walk through a concrete example."></textarea>
+    <p class="hint" id="instructionsHelp">Add instructions for tone, emphasis, structure, or examples. These supplement the app's default guidance and apply to future answers. Up to 8,000 characters.</p>
 
     <label for="hotkey">Global shortcut <span class="hint">(toggles record from any app)</span></label>
     <input type="text" id="hotkey" autocomplete="off" spellcheck="false" />

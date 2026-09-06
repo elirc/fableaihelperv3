@@ -1,191 +1,178 @@
 import { describe, expect, test } from 'vitest';
-import type { AnswerStyle } from '../src/shared/types';
-import { buildSystemPrompt, buildSystemPromptBlocks, buildUserMessage } from '../src/main/prompt';
+import type { AnswerStyle, ConversationTurn } from '../src/shared/types';
+import {
+  buildConversationMessages, buildSystemPrompt, buildSystemPromptBlocks, buildUserMessage,
+} from '../src/main/prompt';
 
 const STYLES: AnswerStyle[] = ['brief', 'balanced', 'detailed'];
+const PERSONALIZATION = {
+  personalProfile: 'Career changer learning backend development; use payments examples.',
+  customInstructions: 'Use plain English and explain unfamiliar terms.',
+};
 
 describe('buildSystemPrompt', () => {
-  test('always states the coach role and first-person instruction', () => {
-    const p = buildSystemPrompt('', '', 'balanced');
-    expect(p).toMatch(/interview coach/i);
-    expect(p).toMatch(/mock interview/i);
-    expect(p).toMatch(/first person/i);
+  test('retains the interview coach role and standard rehearsal format', () => {
+    const prompt = buildSystemPrompt('', '', 'balanced');
+    expect(prompt).toMatch(/interview coach/i);
+    expect(prompt).toMatch(/mock interview/i);
+    expect(prompt).toMatch(/first person/i);
+    expect(prompt).toMatch(/study material/i);
+    expect(prompt).toContain('**Key beats**');
   });
 
-  test('frames the output as study material with a Key beats section', () => {
-    const p = buildSystemPrompt('', '', 'balanced');
-    expect(p).toMatch(/study material/i);
-    expect(p).toContain('**Key beats**');
-    // The Key beats section must survive every style, including brief — the
-    // style rule is scoped to the spoken answer only.
-    expect(p).toMatch(/Key beats section is always present/i);
+  test('shapes answers by question type and requires technical accuracy', () => {
+    const prompt = buildSystemPrompt('', '', 'balanced');
+    expect(prompt).toContain('Behavioural');
+    expect(prompt).toContain('Technical or knowledge');
+    expect(prompt).toContain('Motivation');
+    expect(prompt).toMatch(/technically correct/i);
   });
 
-  test('shapes answers by question type instead of one behavioural mould', () => {
-    const p = buildSystemPrompt('', '', 'balanced');
-    expect(p).toMatch(/Behavioural/);
-    expect(p).toMatch(/Technical or knowledge/);
-    expect(p).toMatch(/Motivation/);
-    // Wrong technical answers are worse than short ones — pinned because it is
-    // the quality bar the whole practice loop depends on.
-    expect(p).toMatch(/technically correct/i);
+  test('omits empty and whitespace-only saved context sections', () => {
+    const prompt = buildSystemPrompt(' \n ', '\t', 'brief', {
+      personalProfile: '\n ', customInstructions: ' ',
+    });
+    expect(prompt).not.toContain('--- THE');
+    expect(prompt).not.toContain('Ground every answer');
   });
 
-  test('omits resume/JD sections and grounding clause when profile is empty', () => {
-    const p = buildSystemPrompt('', '', 'balanced');
-    expect(p).not.toContain('RESUME');
-    expect(p).not.toContain('JOB THEY ARE INTERVIEWING FOR');
-    expect(p).not.toMatch(/Ground every answer/);
+  test('never invents personal experience even without a saved resume', () => {
+    const prompt = buildSystemPrompt('', '', 'brief');
+    expect(prompt).toMatch(/Never invent experience/i);
+    expect(prompt).toMatch(/hypothetical example/i);
+    expect(prompt).toMatch(/placeholders/i);
   });
 
-  test('embeds the resume when provided', () => {
-    const p = buildSystemPrompt('10 years building payments systems', '', 'balanced');
-    expect(p).toMatch(/--- THE USER'S RESUME ---/);
-    expect(p).toMatch(/payments systems/);
-    expect(p).toMatch(/Ground every answer/);
+  test('grounds answers when only the resume is set', () => {
+    const prompt = buildSystemPrompt('Built payment systems', '', 'brief');
+    expect(prompt).toContain("--- THE USER'S RESUME ---\nBuilt payment systems");
+    expect(prompt).not.toContain('--- THE JOB THEY ARE INTERVIEWING FOR ---');
+    expect(prompt).toContain('Ground every answer');
   });
 
-  test('embeds the job description when provided', () => {
-    const p = buildSystemPrompt('', 'Senior Backend Engineer, Go and Postgres', 'balanced');
-    expect(p).toMatch(/--- THE JOB THEY ARE INTERVIEWING FOR ---/);
-    expect(p).toMatch(/Senior Backend Engineer/);
+  test('grounds answers when only the target role is set', () => {
+    const prompt = buildSystemPrompt('', 'Senior Go Engineer', 'brief');
+    expect(prompt).toContain('--- THE JOB THEY ARE INTERVIEWING FOR ---\nSenior Go Engineer');
+    expect(prompt).not.toContain("--- THE USER'S RESUME ---");
+    expect(prompt).toContain('Ground every answer');
   });
 
-  test('includes both sections and the grounding clause when both are set', () => {
-    const p = buildSystemPrompt('resume text', 'job text', 'balanced');
-    expect(p).toMatch(/resume text/);
-    expect(p).toMatch(/job text/);
-    expect(p).toMatch(/Never invent experience/);
+  test('grounds answers with a personal profile without requiring a resume or job description', () => {
+    const prompt = buildSystemPrompt('', '', 'brief', { personalProfile: PERSONALIZATION.personalProfile });
+    expect(prompt).toContain("--- THE USER'S PERSONAL PROFILE ---\n" + PERSONALIZATION.personalProfile);
+    expect(prompt).toContain('Ground every answer');
+    expect(prompt).not.toContain("--- THE USER'S RESUME ---");
   });
 
-  test('trims whitespace-only input so it counts as empty', () => {
-    const p = buildSystemPrompt('   \n  ', '\t', 'balanced');
-    expect(p).not.toContain('RESUME');
-    expect(p).not.toMatch(/Ground every answer/);
-  });
-
-  test('is the cached prefix followed by the style suffix', () => {
-    const { cachedPrefix, styleSuffix } = buildSystemPromptBlocks('r', 'j', 'detailed');
-    const whole = buildSystemPrompt('r', 'j', 'detailed');
-    expect(whole.startsWith(cachedPrefix)).toBe(true);
-    expect(whole.endsWith(styleSuffix)).toBe(true);
-  });
-
-  // Exact concatenation, not just startsWith/endsWith: an extra character
-  // between the blocks would make the single-string prompt (Groq) diverge from
-  // the two-block prompt (Anthropic) and the styles would drift apart per provider.
-  test('is exactly cachedPrefix + blank line + styleSuffix for every style', () => {
-    for (const style of STYLES) {
-      const { cachedPrefix, styleSuffix } = buildSystemPromptBlocks('r', 'j', style);
-      expect(buildSystemPrompt('r', 'j', style)).toBe(cachedPrefix + '\n\n' + styleSuffix);
+  test('keeps all saved context together and trims boundary whitespace', () => {
+    const { cachedPrefix, styleSuffix } = buildSystemPromptBlocks(' resume text ', ' job text ', 'brief', {
+      personalProfile: ' profile text ', customInstructions: ' instruction text ',
+    });
+    for (const text of ['resume text', 'job text', 'profile text', 'instruction text']) {
+      expect(cachedPrefix).toContain('\n' + text);
+      expect(cachedPrefix).not.toContain('\n ' + text);
+      expect(styleSuffix).not.toContain(text);
     }
   });
 
-  test('resume-only profile omits the JD section but keeps the grounding clause', () => {
-    const { cachedPrefix } = buildSystemPromptBlocks('payments systems', '', 'balanced');
-    expect(cachedPrefix).toContain("--- THE USER'S RESUME ---");
-    expect(cachedPrefix).not.toContain('--- THE JOB THEY ARE INTERVIEWING FOR ---');
-    expect(cachedPrefix).toMatch(/Ground every answer/);
+  test('custom instructions override coaching defaults while preserving personal grounding', () => {
+    const prompt = buildSystemPrompt('resume text', '', 'brief', PERSONALIZATION);
+    expect(prompt).toContain(PERSONALIZATION.customInstructions);
+    expect(prompt).toMatch(/override the default tone, role, answer length, or format/i);
+    expect(prompt).toMatch(/including the Key beats format/i);
+    expect(prompt).toMatch(/Retain relevant resume\/profile grounding/i);
+    expect(prompt).toMatch(/never invent personal experience/i);
   });
 
-  test('JD-only profile omits the resume section but keeps the grounding clause', () => {
-    const { cachedPrefix } = buildSystemPromptBlocks('', 'Senior Backend Engineer', 'balanced');
-    expect(cachedPrefix).not.toContain("--- THE USER'S RESUME ---");
-    expect(cachedPrefix).toContain('--- THE JOB THEY ARE INTERVIEWING FOR ---');
-    expect(cachedPrefix).toMatch(/Ground every answer/);
+  test.each(STYLES)('combined %s prompt is exactly the two caching blocks joined by a blank line', (style) => {
+    const { cachedPrefix, styleSuffix } = buildSystemPromptBlocks('r', 'j', style, PERSONALIZATION);
+    expect(buildSystemPrompt('r', 'j', style, PERSONALIZATION)).toBe(cachedPrefix + '\n\n' + styleSuffix);
   });
 });
 
-describe('answerStyle', () => {
-  test('balanced keeps v1 wording, so the default behaviour is unchanged', () => {
-    expect(buildSystemPrompt('', '', 'balanced')).toMatch(
-      /Be concise and confident: a few sentences for simple questions, short structured points for complex ones\./,
+describe('answerStyle and follow-up instructions', () => {
+  test('brief starts with one or two spoken sentences and compact study notes', () => {
+    const { styleSuffix } = buildSystemPromptBlocks('', '', 'brief');
+    expect(styleSuffix).toMatch(/one or two spoken sentences/i);
+    expect(styleSuffix).toMatch(/compact Key beats/i);
+  });
+
+  test('balanced and detailed lead directly, with different supporting depth', () => {
+    expect(buildSystemPromptBlocks('', '', 'balanced').styleSuffix).toMatch(/concise direct answer/i);
+    const detailed = buildSystemPromptBlocks('', '', 'detailed').styleSuffix;
+    expect(detailed).toMatch(/one concise sentence/i);
+    expect(detailed).toMatch(/three to five short supporting points/i);
+  });
+
+  test.each(STYLES)('%s permits substantive follow-ups and explicit depth requests', (style) => {
+    const { styleSuffix } = buildSystemPromptBlocks('', '', style);
+    expect(styleSuffix).toMatch(/explicit request for more detail, examples, code, tradeoffs, or a step-by-step/i);
+    expect(styleSuffix).toMatch(/takes precedence over the default brevity limit/i);
+    expect(styleSuffix).toMatch(/worked examples/i);
+    expect(styleSuffix).toMatch(/avoid unnecessary repetition/i);
+  });
+
+  test('follow-up explanations can use a natural format without mandatory study notes', () => {
+    const prompt = buildSystemPrompt('', '', 'brief');
+    expect(prompt).toMatch(/not a new interview question/i);
+    expect(prompt).toMatch(/A follow-up does not need a Key beats section/i);
+  });
+
+  test('styles remain distinct and live outside the stable cached prefix', () => {
+    const blocks = STYLES.map(style => buildSystemPromptBlocks('resume', 'jd', style, PERSONALIZATION));
+    expect(new Set(blocks.map(block => block.cachedPrefix)).size).toBe(1);
+    expect(new Set(blocks.map(block => block.styleSuffix)).size).toBe(STYLES.length);
+    for (const block of blocks) expect(block.cachedPrefix).not.toContain(block.styleSuffix);
+  });
+
+  test('the cached prefix is also identical across styles without saved context', () => {
+    const prefixes = STYLES.map(style => buildSystemPromptBlocks('', '', style).cachedPrefix);
+    expect(new Set(prefixes).size).toBe(1);
+  });
+
+  test('an unknown style falls back to concise-first without changing the cached prefix', () => {
+    expect(buildSystemPromptBlocks('resume', 'jd', 'wat' as AnswerStyle, PERSONALIZATION)).toEqual(
+      buildSystemPromptBlocks('resume', 'jd', 'brief', PERSONALIZATION),
     );
   });
-
-  test('brief asks for one or two spoken sentences', () => {
-    const p = buildSystemPrompt('', '', 'brief');
-    expect(p).toMatch(/one or two spoken sentences/i);
-    expect(p).not.toMatch(/Be concise and confident/);
-  });
-
-  test('detailed asks for structured supporting points', () => {
-    const p = buildSystemPrompt('', '', 'detailed');
-    expect(p).toMatch(/structured/i);
-    expect(p).toMatch(/supporting points/i);
-    expect(p).not.toMatch(/Be concise and confident/);
-  });
-
-  test('every style produces a distinct, non-empty instruction', () => {
-    const suffixes = STYLES.map((s) => buildSystemPromptBlocks('', '', s).styleSuffix);
-    for (const s of suffixes) expect(s.length).toBeGreaterThan(0);
-    expect(new Set(suffixes).size).toBe(STYLES.length);
-  });
-
-  test('an unknown style falls back to balanced instead of splicing in undefined', () => {
-    const p = buildSystemPrompt('', '', 'wat' as AnswerStyle);
-    expect(p).not.toMatch(/undefined/);
-    expect(p).toMatch(/Be concise and confident/);
-  });
-
-  // The caching invariant. Prompt caching is a prefix match, so if the style
-  // policy lived inside the cached block, flipping this setting would throw away
-  // the cached resume+JD and cost a full uncached prefill (i.e. a slow first
-  // token) on the next answer.
-  test('changing the style does not change the cached prefix', () => {
-    const prefixes = STYLES.map((s) => buildSystemPromptBlocks('resume', 'jd', s).cachedPrefix);
-    expect(new Set(prefixes).size).toBe(1);
-  });
-
-  test('the cached prefix is byte-identical across styles for an empty profile too', () => {
-    const prefixes = STYLES.map((s) => buildSystemPromptBlocks('', '', s).cachedPrefix);
-    expect(new Set(prefixes).size).toBe(1);
-  });
-
-  test('an unknown style still leaves the cached prefix untouched', () => {
-    // The fallback must live entirely in the suffix: if it ever leaked into the
-    // prefix, a corrupt settings file would silently invalidate the cache.
-    const good = buildSystemPromptBlocks('resume', 'jd', 'balanced');
-    const bad = buildSystemPromptBlocks('resume', 'jd', 'wat' as AnswerStyle);
-    expect(bad.cachedPrefix).toBe(good.cachedPrefix);
-    expect(bad.styleSuffix).toBe(good.styleSuffix);
-  });
-
-  test('the style instruction is not duplicated into the cached prefix', () => {
-    const { cachedPrefix, styleSuffix } = buildSystemPromptBlocks('resume', 'jd', 'brief');
-    expect(cachedPrefix).not.toContain(styleSuffix);
-  });
-
-  test('the resume and JD stay in the cached prefix, not the style suffix', () => {
-    const { cachedPrefix, styleSuffix } = buildSystemPromptBlocks('payments systems', 'Go and Postgres', 'brief');
-    expect(cachedPrefix).toContain('payments systems');
-    expect(cachedPrefix).toContain('Go and Postgres');
-    expect(styleSuffix).not.toContain('payments systems');
-    expect(styleSuffix).not.toContain('Go and Postgres');
-  });
 });
 
-describe('buildUserMessage', () => {
-  test('wraps the transcript and asks for the model answer', () => {
-    const m = buildUserMessage('Tell me about yourself.');
-    expect(m).toContain('Tell me about yourself.');
-    expect(m).toMatch(/Write the model answer\./);
-  });
-
-  // Pinned exactly: the user turn is part of every request, and any accidental
-  // wording drift here would change token counts and model behaviour silently.
-  test('produces the exact wrapping format', () => {
+describe('conversation messages', () => {
+  test('retains the initial-question wrapper for backward compatibility', () => {
     expect(buildUserMessage('Why Go?')).toBe(
       'My practice partner just asked:\n"""\nWhy Go?\n"""\n\nWrite the model answer.',
     );
+    expect(buildConversationMessages('Why Go?')).toEqual([
+      { role: 'user', content: buildUserMessage('Why Go?') },
+    ]);
+    expect(buildConversationMessages('Why Go?', [])).toEqual(buildConversationMessages('Why Go?'));
   });
 
-  test('passes the transcript through verbatim, including newlines and quotes', () => {
+  test('preserves historical user and assistant turns in order', () => {
+    const context: ConversationTurn[] = [
+      { question: 'What are closures?', answer: 'Functions that retain access to their lexical scope.' },
+      { question: 'Give me an example.', answer: 'A counter function can retain a private count.' },
+    ];
+    const messages = buildConversationMessages('Walk through the counter step by step.', context);
+    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'user', 'assistant', 'user']);
+    expect(messages[0].content).toBe(buildUserMessage(context[0].question));
+    expect(messages[1].content).toBe(context[0].answer);
+    expect(messages[2].content).toContain(context[1].question);
+    expect(messages[2].content).toMatch(/follow-up request/i);
+    expect(messages[3].content).toBe(context[1].answer);
+    expect(messages[4].content).toContain('Walk through the counter step by step.');
+    expect(messages[4].content).toMatch(/follow-up request/i);
+    expect(messages[4].content).not.toContain('My practice partner just asked');
+  });
+
+  test('preserves quotes and newlines without mutating the supplied conversation', () => {
     const transcript = 'Line one.\nLine two with "quotes".';
-    expect(buildUserMessage(transcript)).toContain(transcript);
-  });
-
-  test('does not carry the answer style, so the user turn stays cache-neutral', () => {
-    expect(buildUserMessage('hi')).not.toMatch(/sentence|structured|concise/i);
+    const context: ConversationTurn[] = [{ question: transcript, answer: 'Answer\nwith a second line.' }];
+    const original = structuredClone(context);
+    const messages = buildConversationMessages(transcript, context);
+    expect(messages[0].content).toContain(transcript);
+    expect(messages[1].content).toBe(context[0].answer);
+    expect(messages[2].content).toContain(transcript);
+    expect(context).toEqual(original);
   });
 });

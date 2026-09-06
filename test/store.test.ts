@@ -118,7 +118,7 @@ describe('store validation of settings.json', () => {
     expect(v.jobDescription).toBe('');
     expect(v.alwaysOnTop).toBe(true);
     expect(v.llmProvider).toBe('anthropic');
-    expect(v.answerStyle).toBe('balanced');
+    expect(v.answerStyle).toBe('brief');
     expect(v.hotkey).toBe(DEFAULT_HOTKEY);
     expect(v.hasDeepgramKey).toBe(false);
 
@@ -127,7 +127,7 @@ describe('store validation of settings.json', () => {
     const profile = store.getProfile();
     expect(profile.resume).toBe('');
     expect(profile.llmProvider).toBe('anthropic');
-    expect(profile.answerStyle).toBe('balanced');
+    expect(profile.answerStyle).toBe('brief');
   });
 
   test('one bad field does not cost the user the rest of the file', async () => {
@@ -167,7 +167,7 @@ describe('store validation of settings.json', () => {
     expect(store.getSettingsView()).toMatchObject({
       resume: '',
       llmProvider: 'anthropic',
-      answerStyle: 'balanced',
+      answerStyle: 'brief',
       hotkey: DEFAULT_HOTKEY,
       hasDeepgramKey: false,
     });
@@ -311,10 +311,39 @@ describe('store patch semantics', () => {
 });
 
 describe('store answerStyle and hotkey', () => {
-  test('default to balanced and the shared DEFAULT_HOTKEY', async () => {
+  test('upgrading keeps an explicitly saved answer style', async () => {
+    writeSettings({ answerStyle: 'balanced', resume: 'keep my resume', secrets: { groqKey: encBlob('gsk-existing') } });
+    const store = await freshStore();
+    expect(store.getSettingsView()).toMatchObject({ answerStyle: 'balanced', personalProfile: '', customInstructions: '' });
+    store.applySettingsPatch({ personalProfile: 'Python developer', customInstructions: 'Use practical examples.' });
+    store.resetCacheForTests();
+    expect(store.getProfile()).toMatchObject({
+      answerStyle: 'balanced', resume: 'keep my resume', personalProfile: 'Python developer', customInstructions: 'Use practical examples.',
+    });
+    expect(store.getSecret('groqKey')).toBe('gsk-existing');
+  });
+
+  test('profile and custom instructions can be edited and cleared independently', async () => {
+    const store = await freshStore();
+    store.applySettingsPatch({ personalProfile: 'Backend engineer', customInstructions: 'Prefer Go.' });
+    store.applySettingsPatch({ personalProfile: '' });
+    store.resetCacheForTests();
+    expect(store.getProfile()).toMatchObject({ personalProfile: '', customInstructions: 'Prefer Go.' });
+    store.applySettingsPatch({ customInstructions: '' });
+    store.resetCacheForTests();
+    expect(store.getSettingsView().customInstructions).toBe('');
+  });
+
+  test('invalid saved personalization fields do not discard other settings', async () => {
+    writeSettings({ personalProfile: [], customInstructions: 'x'.repeat(8001), resume: 'keep', answerStyle: 'detailed' });
+    const store = await freshStore();
+    expect(store.getProfile()).toMatchObject({ personalProfile: '', customInstructions: '', resume: 'keep', answerStyle: 'detailed' });
+  });
+
+  test('default to brief and the shared DEFAULT_HOTKEY', async () => {
     const store = await freshStore();
     const v = store.getSettingsView();
-    expect(v.answerStyle).toBe('balanced');
+    expect(v.answerStyle).toBe('brief');
     expect(v.hotkey).toBe(DEFAULT_HOTKEY);
     expect(store.getHotkey()).toBe(DEFAULT_HOTKEY);
   });

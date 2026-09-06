@@ -8,8 +8,10 @@ import {
 import type {
   AnswerMetrics,
   AnswerStyle,
+  AskOptions,
   AnthropicModelId,
   AudioSource,
+  ConversationTurn,
   GroqModelId,
   LlmProviderId,
   RendererApi,
@@ -65,6 +67,11 @@ const regenBtn = $<HTMLButtonElement>('regenBtn');
 const askForm = $<HTMLFormElement>('askForm');
 const askInput = $<HTMLInputElement>('askInput');
 const askBtn = $<HTMLButtonElement>('askBtn');
+const newQuestionBtn = $<HTMLButtonElement>('newQuestionBtn');
+const followupModeBtn = $<HTMLButtonElement>('followupModeBtn');
+const askModeHint = $('askModeHint');
+const deeperBtn = $<HTMLButtonElement>('deeperBtn');
+const exampleBtn = $<HTMLButtonElement>('exampleBtn');
 const srAnnounce = $('srAnnounce');
 const mainView = $('mainView');
 const settingsView = $('settingsView');
@@ -103,9 +110,13 @@ interface Entry {
   answer: string;
   metrics: AnswerMetrics | null;
   live: boolean;
+  completed: boolean;
+  context: ConversationTurn[];
+  answerStyle?: AnswerStyle;
 }
 let entries: Entry[] = [];
 let viewIndex = -1;
+let followupMode = false;
 
 const readyText = (): string =>
   hotkeyActive ? `Ready — press Record or ${hotkeyLabel}` : BASE_READY_TEXT;
@@ -249,6 +260,7 @@ async function startRecording(): Promise<void> {
   const myRun = ++runId;
   clearError();
   sessionId = null;
+  followupMode = false;
   beginLiveEntry();
   setState('starting');
 
@@ -382,7 +394,7 @@ function toggleRecording(): void {
  * stt:partial, then llm:delta / llm:done / session:error — so the existing
  * handlers do all the rendering work.
  */
-async function submitAsk(text: string): Promise<void> {
+async function submitAsk(text: string, options: AskOptions = {}): Promise<void> {
   // Claim the UI the way onSessionError does: an in-flight recording start
   // whose token is now stale must tear itself down instead of adopting the UI
   // mid-ask. Asking over a still-streaming answer is fine — main aborts the
@@ -391,14 +403,14 @@ async function submitAsk(text: string): Promise<void> {
   const myRun = ++runId;
   sessionId = null;
   clearError();
-  beginLiveEntry();
+  beginLiveEntry(options);
   const live = liveEntry();
   if (live) live.question = text; // the transcript box shows the question immediately
   setState('answering');
 
   let result: Result<number>;
   try {
-    result = await api.askQuestion(text);
+    result = await api.askQuestion(text, options);
   } catch (err) {
     if (myRun !== runId) return; // a newer run owns the UI now
     dropLiveEntry();
@@ -425,23 +437,66 @@ askForm.addEventListener('submit', (e) => {
   e.preventDefault();
   const text = askInput.value.trim();
   if (text === '' || askInput.disabled) return;
-  void submitAsk(text);
+  if (followupMode) {
+    const context = viewedContext();
+    if (!context || state !== 'idle') return;
+    void submitAsk(text, { context });
+  } else {
+    void submitAsk(text);
+  }
 });
 
 regenBtn.addEventListener('click', () => {
-  const q = entries[viewIndex]?.question.trim() ?? '';
-  if (q === '' || (state !== 'idle' && state !== 'answering')) return;
-  void submitAsk(q);
+  const entry = entries[viewIndex];
+  const q = entry?.question.trim() ?? '';
+  if (!entry || q === '' || (state !== 'idle' && state !== 'answering')) return;
+  followupMode = entry.context.length > 0;
+  void submitAsk(q, { context: entry.context, answerStyle: entry.answerStyle });
+});
+
+/** Keep the original question as the anchor, then the most recent follow-ups. */
+function boundedContext(context: ConversationTurn[]): ConversationTurn[] {
+  return context.length <= MAX_HISTORY
+    ? context
+    : [...context.slice(0, 1), ...context.slice(-(MAX_HISTORY - 1))];
+}
+
+/** Follow-ups belong to the viewed branch, including when history is browsed. */
+function viewedContext(): ConversationTurn[] | null {
+  const entry = entries[viewIndex];
+  if (!entry?.completed || !entry.answer.trim()) return null;
+  return boundedContext([...entry.context, { question: entry.question, answer: entry.answer }]);
+}
+
+function requestFollowup(text: string): void {
+  const context = viewedContext();
+  if (state !== 'idle' || !context) return;
+  followupMode = true;
+  // Depth applies only to this answer; keep the saved first-answer style.
+  void submitAsk(text, { context, answerStyle: 'detailed' });
+}
+
+deeperBtn.addEventListener('click', () => {
+  requestFollowup('Go deeper on your previous answer. Explain the reasoning, practical details, and relevant tradeoffs without repeating the introduction.');
+});
+exampleBtn.addEventListener('click', () => {
+  requestFollowup('Show a concrete, worked example of your previous answer, tailored to my profile. Walk through the steps and explain why they work.');
+});
+newQuestionBtn.addEventListener('click', () => {
+  followupMode = false;
+  renderEntry();
+  askInput.focus();
+});
+followupModeBtn.addEventListener('click', () => {
+  if (state !== 'idle' || !viewedContext()) return;
+  followupMode = true;
+  renderEntry();
+  askInput.focus();
 });
 
 function setState(next: State): void {
   state = next;
   recordBtn.classList.toggle('recording', next === 'recording');
-  // The ask box stays usable while an answer streams (asking aborts the old
-  // session), but not while audio capture is in any stage of flight.
-  const askLocked = next === 'starting' || next === 'recording' || next === 'finalizing';
-  askInput.disabled = askLocked;
-  askBtn.disabled = askLocked;
   switch (next) {
     case 'idle':
       recordLabel.textContent = 'Record';
@@ -480,8 +535,14 @@ const liveEntry = (): Entry | undefined => {
   return last?.live ? last : undefined;
 };
 
-function beginLiveEntry(): void {
-  entries.push({ question: '', answer: '', metrics: null, live: true });
+function beginLiveEntry(options: AskOptions = {}): void {
+  // Retire interrupted partial output without allowing it into future context.
+  dropLiveEntry();
+  entries.push({
+    question: '', answer: '', metrics: null, live: true, completed: false,
+    context: boundedContext(options.context ?? []).map((turn) => ({ ...turn })),
+    answerStyle: options.answerStyle,
+  });
   if (entries.length > MAX_HISTORY) entries = entries.slice(entries.length - MAX_HISTORY);
   viewIndex = entries.length - 1;
   renderEntry();
@@ -570,6 +631,26 @@ function renderEntry(): void {
     (state === 'idle' || state === 'answering')
   );
 
+  const canFollowup = state === 'idle' && !!e?.completed && e.answer.trim() !== '';
+  deeperBtn.disabled = !canFollowup;
+  exampleBtn.disabled = !canFollowup;
+  followupModeBtn.disabled = !canFollowup;
+  newQuestionBtn.setAttribute('aria-pressed', followupMode ? 'false' : 'true');
+  followupModeBtn.setAttribute('aria-pressed', followupMode ? 'true' : 'false');
+  // New questions can still replace a streaming answer. Follow-ups wait for a
+  // complete answer, so an interrupted fragment never becomes model context.
+  const recording = state === 'starting' || state === 'recording' || state === 'finalizing';
+  askInput.disabled = recording || (followupMode && !canFollowup);
+  askBtn.disabled = askInput.disabled;
+  askInput.placeholder = followupMode ? 'Ask about this answer, or request more detail…' : 'Or type a practice question here…';
+  askInput.setAttribute('aria-label', followupMode ? 'Follow up on the viewed answer' : 'Type a new question');
+  askBtn.textContent = followupMode ? 'Follow up' : 'Ask';
+  askModeHint.textContent = followupMode
+    ? canFollowup
+      ? `Continuing: ${e.question.length > 100 ? `${e.question.slice(0, 97)}…` : e.question}`
+      : state === 'answering' ? 'Follow-ups are available when the answer is complete.' : 'Choose a completed answer from history, or start a new question.'
+    : 'New question · use Follow up to continue the answer you are viewing.';
+
   const m = e?.metrics;
   if (m) {
     latencyTag.hidden = false;
@@ -611,6 +692,7 @@ nextBtn.addEventListener('click', () => {
 clearBtn.addEventListener('click', () => {
   if (state !== 'idle' || entries.length === 0) return;
   entries = [];
+  followupMode = false;
   viewIndex = -1;
   renderedIndex = -1;
   renderEntry(); // placeholders return; the history bar hides itself
@@ -653,9 +735,10 @@ api.onLlmDone((e) => {
     live.answer = e.answer;
     live.metrics = e.metrics;
     live.live = false;
+    live.completed = true;
   }
   setState('idle');
-  statusText.textContent = 'Done — press Record for the next question';
+  statusText.textContent = 'Done — explore this answer below or ask a new question';
 });
 
 api.onSessionError((e) => {
@@ -707,14 +790,14 @@ function clearError(): void {
 }
 
 // ---------- Settings ----------
-const textFields = ['resume', 'jobDescription'] as const;
+const textFields = ['resume', 'jobDescription', 'personalProfile', 'customInstructions'] as const;
 const keyFields = ['deepgramKey', 'anthropicKey', 'groqKey'] as const;
 const PROVIDERS: readonly string[] = ['anthropic', 'groq'];
 const STYLES: readonly string[] = ['brief', 'balanced', 'detailed'];
 const SOURCES: readonly string[] = ['microphone', 'system'];
 
 const asProvider = (v: string): LlmProviderId => (PROVIDERS.includes(v) ? (v as LlmProviderId) : 'anthropic');
-const asStyle = (v: string): AnswerStyle => (STYLES.includes(v) ? (v as AnswerStyle) : 'balanced');
+const asStyle = (v: string): AnswerStyle => (STYLES.includes(v) ? (v as AnswerStyle) : 'brief');
 const asSource = (v: string): AudioSource => (SOURCES.includes(v) ? (v as AudioSource) : 'microphone');
 const asAnthropicModel = (v: string): AnthropicModelId =>
   (ANTHROPIC_MODELS as readonly string[]).includes(v) ? (v as AnthropicModelId) : DEFAULT_ANTHROPIC_MODEL;
@@ -833,6 +916,8 @@ document.addEventListener('keydown', (e) => {
 let savedTimer: ReturnType<typeof setTimeout> | null = null;
 $('saveBtn').addEventListener('click', async () => {
   const patch: SettingsPatch = {
+    personalProfile: $<HTMLTextAreaElement>('personalProfile').value,
+    customInstructions: $<HTMLTextAreaElement>('customInstructions').value,
     resume: $<HTMLTextAreaElement>('resume').value,
     jobDescription: $<HTMLTextAreaElement>('jobDescription').value,
     llmProvider: asProvider($<HTMLSelectElement>('llmProvider').value),
@@ -875,8 +960,10 @@ void (async () => {
     syncStyleChips(s.answerStyle);
     audioSource = s.audioSource;
     const missingLlmKey = s.llmProvider === 'groq' ? !s.hasGroqKey : !s.hasAnthropicKey;
-    if ((!s.hasDeepgramKey || missingLlmKey) && state === 'idle') {
-      statusText.textContent = 'First run: open Settings (gear icon) and add your API keys';
+    if (missingLlmKey && state === 'idle') {
+      statusText.textContent = 'Open Settings (gear icon) and add your answer provider API key';
+    } else if (!s.hasDeepgramKey && state === 'idle') {
+      statusText.textContent = 'Ready — type a question. Add a Deepgram key in Settings to record audio.';
     }
   } catch (err) {
     showError(err);

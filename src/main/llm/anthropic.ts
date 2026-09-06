@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { DEFAULT_ANTHROPIC_MODEL, type AnswerStyle, type AppError } from '../../shared/types';
 import type { LlmProvider } from '../session';
-import { buildSystemPromptBlocks, buildUserMessage } from '../prompt';
+import { buildSystemPromptBlocks, buildConversationMessages, type PromptPersonalization } from '../prompt';
 import { estimateCostUsd } from './pricing';
 
 // The model is now a Settings pick from ANTHROPIC_MODELS (shared/types.ts) so
@@ -44,27 +44,29 @@ export function createAnthropicProvider(
   jd: string,
   answerStyle: AnswerStyle,
   model: string = DEFAULT_ANTHROPIC_MODEL,
+  personalization: PromptPersonalization = {},
 ): LlmProvider {
   // maxRetries: 0 — the SDK's default retry policy backs off for seconds, which
   // is forever mid-practice. We do our own single, immediate, tightly-scoped
   // retry below instead.
   const client = new Anthropic({ apiKey, maxRetries: 0 });
-  const { cachedPrefix, styleSuffix } = buildSystemPromptBlocks(resume, jd, answerStyle);
 
   return {
-    async generate(transcript, onDelta, signal, onUsage) {
+    async generate(transcript, onDelta, signal, onUsage, options) {
+      const style = options?.answerStyle ?? answerStyle;
+      const { cachedPrefix, styleSuffix } = buildSystemPromptBlocks(resume, jd, style, personalization);
       // Built once so a retry re-sends byte-identical bytes and can still hit
       // the cache the first attempt may have written.
       const params: Anthropic.MessageStreamParams = {
         model,
-        max_tokens: MAX_TOKENS,
+        max_tokens: style === 'detailed' || options?.context?.length ? 2048 : MAX_TOKENS,
         ...(THINKING_DISABLED_MODELS.has(model) ? { thinking: { type: 'disabled' as const } } : {}),
         system: [
           { type: 'text', text: cachedPrefix, cache_control: { type: 'ephemeral' } },
           // After the breakpoint: changing answerStyle costs nothing.
           { type: 'text', text: styleSuffix },
         ],
-        messages: [{ role: 'user', content: buildUserMessage(transcript) }],
+        messages: buildConversationMessages(transcript, options?.context),
       };
 
       // Tracks whether anything has already been painted into the answer panel.

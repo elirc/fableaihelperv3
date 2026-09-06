@@ -12,11 +12,20 @@ export interface SseUsage {
   completion_tokens?: number;
 }
 
+export interface SseError {
+  message?: string;
+  code?: string | number;
+  type?: string;
+}
+
 export interface SseParseResult {
   deltas: string[];
   rest: string;
   /** Present only when a parsed line carried a usage object; the last one seen wins. */
   usage?: SseUsage;
+  /** Errors can arrive after HTTP 200, inside the event stream. */
+  error?: SseError;
+  done?: true;
 }
 
 export function parseSSEChunk(buffer: string): SseParseResult {
@@ -28,11 +37,19 @@ export function parseSSEChunk(buffer: string): SseParseResult {
     buffer = buffer.slice(nl + 1);
     if (!line.startsWith('data:')) continue; // skip comments/keep-alives/blank lines
     const payload = line.slice(5).trim();
-    if (payload === '[DONE]') continue;
+    if (payload === '[DONE]') {
+      return { deltas, rest: '', ...(usage ? { usage } : {}), done: true };
+    }
     try {
       const obj = JSON.parse(payload);
+      if (obj?.error) {
+        const error: SseError = typeof obj.error === 'string'
+          ? { message: obj.error }
+          : typeof obj.error === 'object' ? obj.error : {};
+        return { deltas, rest: '', ...(usage ? { usage } : {}), error };
+      }
       const delta = obj?.choices?.[0]?.delta?.content;
-      if (delta) deltas.push(delta);
+      if (typeof delta === 'string' && delta) deltas.push(delta);
       // Usage arrives on the final chunk when the request asked for it
       // (stream_options.include_usage); Groq also mirrors it under x_groq.
       const u = obj?.usage ?? obj?.x_groq?.usage;
@@ -59,8 +76,8 @@ export function parseSSEChunk(buffer: string): SseParseResult {
 //
 // Genuinely incomplete JSON still parses to nothing and is discarded, which is
 // the right outcome: there is no more data coming to complete it.
-export function parseSSETail(rest: string): { deltas: string[]; usage?: SseUsage } {
+export function parseSSETail(rest: string): Omit<SseParseResult, 'rest'> {
   if (!rest.trim()) return { deltas: [] };
-  const { deltas, usage } = parseSSEChunk(rest.endsWith('\n') ? rest : rest + '\n');
-  return usage ? { deltas, usage } : { deltas };
+  const { rest: _rest, ...result } = parseSSEChunk(rest.endsWith('\n') ? rest : rest + '\n');
+  return result;
 }

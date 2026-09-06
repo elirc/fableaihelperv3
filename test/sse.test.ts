@@ -89,6 +89,22 @@ describe('parseSSEChunk', () => {
     expect(deltas).toEqual(['ok']);
   });
 
+  test('ignores non-string content instead of emitting objects as answer text', () => {
+    const invalid = 'data: ' + JSON.stringify({ choices: [{ delta: { content: { text: 'bad' } } }] }) + '\n';
+    expect(parseSSEChunk(invalid + dataLine('ok')).deltas).toEqual(['ok']);
+  });
+
+  test('surfaces an SSE error after any preceding content and stops at the error', () => {
+    const error = { message: 'Generation failed', code: 'server_error' };
+    const chunk = dataLine('partial') + 'data: ' + JSON.stringify({ error }) + '\n' + dataLine('ignored');
+    expect(parseSSEChunk(chunk)).toEqual({ deltas: ['partial'], rest: '', error });
+  });
+
+  test('marks DONE and ignores any trailing content in the same chunk', () => {
+    expect(parseSSEChunk(dataLine('answer') + 'data: [DONE]\n' + dataLine('ignored')))
+      .toEqual({ deltas: ['answer'], rest: '', done: true });
+  });
+
   test('ignores event: lines (only data: lines carry content)', () => {
     const { deltas } = parseSSEChunk('event: message\n' + dataLine('x'));
     expect(deltas).toEqual(['x']);
@@ -159,6 +175,11 @@ describe('parseSSETail', () => {
 
   test('ignores a comment-only tail', () => {
     expect(parseSSETail(': keep-alive').deltas).toEqual([]);
+  });
+
+  test('surfaces an error delivered without a trailing newline', () => {
+    expect(parseSSETail('data: {"error":{"message":"Generation failed"}}'))
+      .toEqual({ deltas: [], error: { message: 'Generation failed' } });
   });
 });
 

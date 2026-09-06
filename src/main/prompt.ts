@@ -1,114 +1,146 @@
-import type { AnswerStyle } from '../shared/types';
+import type { AnswerStyle, ConversationTurn } from '../shared/types';
 
-// Builds the system prompt for the answer model from the user's saved profile.
-// Pure functions (no store/electron dependency) so they can be unit-tested directly.
-//
-// This app is a MOCK INTERVIEW PRACTICE tool: a practice partner asks the user
-// a question out loud, and the model writes the answer a strong candidate would
-// give, for the user to study and rehearse against. That framing is not
-// cosmetic — it is why the output carries a "Key beats" section (study material
-// is meant to be learned, not read out), and why answers are shaped by question
-// type rather than forced into one behavioural mould.
-//
-// The prompt is deliberately built as TWO pieces:
-//
-//   cachedPrefix — role instructions + resume + JD. Stable for the whole
-//                  practice session, and the only piece worth marking with
-//                  cache_control (see llm/anthropic.ts).
-//   styleSuffix  — the answer-length policy. Changes whenever the user flips
-//                  the answerStyle setting.
-//
-// Prompt caching is a *prefix match*: any byte change invalidates everything
-// after it. Folding the style policy into the cached block would mean toggling
-// brief/balanced/detailed silently throws away the cached resume+JD and pays a
-// full uncached prefill on the next answer — i.e. a slower first token, which
-// is the one thing this app exists to avoid. Keeping it in its own trailing
-// block means a style change costs nothing.
+// Pure prompt builders shared by every provider. Saved context stays in the
+// cached prefix; changing answer length only changes the trailing style block.
+
+export interface PromptPersonalization {
+  personalProfile?: string;
+  customInstructions?: string;
+}
 
 const ROLE_INSTRUCTIONS =
   'You are an interview coach running a mock interview practice session. The user is ' +
-  'rehearsing out loud with a practice partner who asks them questions. You are given a ' +
-  'transcript of the question that was just asked. Write the model answer the user should ' +
-  'be aiming for — the answer a strong, well-prepared candidate would give — in first ' +
-  'person, in natural spoken English. This is study material, not a live script: the user ' +
-  'reads it, learns the shape, and then practises saying it in their own words.\n\n' +
+  'rehearsing with a practice partner. For a new interview question, write a model answer ' +
+  'the user can study and rehearse: first person, natural spoken English, with the direct ' +
+  'answer first. This is study material. Do not add greetings, meta commentary, quotation ' +
+  'marks around the answer, or internal/system XML tags.\n\n' +
   'Shape the answer to the kind of question it is:\n' +
-  '- Behavioural ("tell me about a time..."): what the situation was, what you personally ' +
-  'did, and how it turned out. Concrete and specific, with a real outcome.\n' +
-  '- Technical or knowledge ("what are React hooks?"): lead with a one-sentence definition, ' +
-  'then how it actually works, then a short concrete example. Be technically correct — a ' +
-  'wrong answer is far worse practice than a short one.\n' +
-  '- Motivation ("why this role?"): tie it to specifics of the job description rather than ' +
-  'generic enthusiasm.\n\n' +
-  'Write the answer itself first: first person, spoken English, no meta commentary, no ' +
-  'greetings, no quotation marks around it. Do not include internal or system XML tags in ' +
-  'your response. Then end with a section headed exactly ' +
-  '"**Key beats**" holding two to four short bullets naming the points the answer has to ' +
-  'hit. The bullets are what the user should memorise; the prose is what good sounds like. ' +
-  'The style rule below governs the spoken answer only — the Key beats section is always ' +
-  'present. If the transcript contains no real question, say so in one line and suggest ' +
-  'what the partner could ask next.';
+  '- Behavioural ("tell me about a time..."): explain the situation, the user\'s own actions, ' +
+  'and the outcome, using only supported personal details.\n' +
+  '- Technical or knowledge ("what are React hooks?"): lead with a clear definition, ' +
+  'then explain how it works and include a compact example when helpful. Be technically correct.\n' +
+  '- Motivation ("why this role?"): connect the user\'s background and goals to specifics ' +
+  'of the target role, where available.\n\n' +
+  'For standard interview answers, end with "**Key beats**" and two to four short bullets ' +
+  'the user can remember. Keep these compact even when the answer is brief. If the latest ' +
+  'message is a follow-up request, answer that request in the context of the previous ' +
+  'question and answer; it is not a new interview question. Coaching, explanations, code, ' +
+  'and examples can use their natural format instead of forcing everything into a ' +
+  'first-person interview answer. A follow-up does not need a Key beats section. ' +
+  'If a new transcript contains no real question or request, say so in one line and ' +
+  'suggest what the partner could ask next.\n\n' +
+  'Never invent experience, qualifications, employers, project details, or results for ' +
+  'the user. Use the resume and personal profile as the source of personal facts; the ' +
+  'job description describes the target role, not the user\'s experience. If a personal ' +
+  'example needs facts that are missing, use a clearly labeled hypothetical example or ' +
+  'a short template with placeholders, or ask for the essential missing detail. Never ' +
+  'present a hypothetical example as something the user actually did.';
 
-// The length/shape policy per style. `balanced` keeps v1's wording verbatim, so
-// the default behaviour is unchanged by the introduction of answerStyle.
 const STYLE_INSTRUCTIONS: Record<AnswerStyle, string> = {
   brief:
-    'Answer in one or two spoken sentences — the shortest reply that fully answers the question. ' +
-    'In the answer itself: no lists, no headings, no lead-in.',
+    'Keep the initial answer concise: one or two spoken sentences that answer the question ' +
+    'directly, followed by compact Key beats. Avoid extra headings and lists in the spoken answer.',
   balanced:
-    'Be concise and confident: a few sentences for simple questions, short structured points for ' +
-    'complex ones.',
+    'Lead with a concise direct answer. Use a few sentences for simple questions and short ' +
+    'structured points for complex ones, followed by compact Key beats.',
   detailed:
-    'Give a structured answer: one sentence that answers directly, then three to five short ' +
-    'supporting points — for a behavioural question, what the situation was, what you did and ' +
-    'what the result was; for a technical one, how it works, when you would reach for it, and ' +
-    'the tradeoff or gotcha that shows real depth. Keep every point short enough to say in one ' +
-    'breath — this is spoken aloud, not read.',
+    'Lead with one concise sentence that answers directly, then give three to five short ' +
+    'supporting points. Include the relevant reasoning, example, or tradeoff, followed by compact Key beats.',
 };
 
+const FOLLOW_UP_INSTRUCTIONS =
+  'These length and format rules are defaults, subject to the user\'s saved custom instructions. ' +
+  'An explicit request for more detail, examples, code, tradeoffs, or a step-by-step ' +
+  'explanation takes precedence over the default brevity limit, including in brief mode. ' +
+  'Give the requested substance immediately; do not merely offer to explain or repeat ' +
+  'the previous answer. Use specific worked examples and enough detail to make them useful. ' +
+  'Continue from the conversation context, refer back only where needed, and avoid ' +
+  'unnecessary repetition. Do not append a generic "would you like more detail?" offer.';
+
 export interface SystemPromptBlocks {
-  /** Stable for the session. Safe to mark with cache_control. */
+  /** Stable while the saved context is unchanged. Safe to mark with cache_control. */
   cachedPrefix: string;
-  /** Varies with the answerStyle setting. Must sit AFTER the cache breakpoint. */
+  /** Varies with answerStyle and must sit AFTER the cache breakpoint. */
   styleSuffix: string;
 }
 
-/** The system prompt split at the cache breakpoint. Providers that support prompt caching should use this. */
+/** The system prompt split at the cache breakpoint, for providers with prompt caching. */
 export function buildSystemPromptBlocks(
   resume: string,
   jd: string,
   answerStyle: AnswerStyle,
+  personalization: PromptPersonalization = {},
 ): SystemPromptBlocks {
   const resumeText = (resume || '').trim();
   const jdText = (jd || '').trim();
+  const profileText = (personalization.personalProfile || '').trim();
+  const customInstructions = (personalization.customInstructions || '').trim();
 
   let cachedPrefix = ROLE_INSTRUCTIONS;
   if (resumeText) cachedPrefix += "\n\n--- THE USER'S RESUME ---\n" + resumeText;
   if (jdText) cachedPrefix += '\n\n--- THE JOB THEY ARE INTERVIEWING FOR ---\n' + jdText;
-  if (resumeText || jdText) {
+  if (profileText) cachedPrefix += "\n\n--- THE USER'S PERSONAL PROFILE ---\n" + profileText;
+  if (resumeText || jdText || profileText) {
     cachedPrefix +=
-      '\n\nGround every answer in the resume and target role above. ' +
-      'Never invent experience the resume does not support — an answer built on a project ' +
-      'the user cannot talk about in the real interview is worse than useless. ' +
-      'For a general knowledge question, answer it on its own merits and use the resume ' +
-      'only to pick the examples.';
+      '\n\nGround every answer in the relevant background, personal profile, and target ' +
+      'role above. Tailor the examples, level of explanation, and emphasis to the user\'s ' +
+      'goals and experience. For a general knowledge question, answer on its own merits ' +
+      'and use this context to choose useful examples without forcing unrelated details in.';
+  }
+  if (customInstructions) {
+    cachedPrefix +=
+      '\n\n--- THE USER\'S CUSTOM SYSTEM INSTRUCTIONS ---\n' + customInstructions +
+      '\n\nApply these saved instructions to personalize your responses. They supplement ' +
+      'the default coaching instructions and override the default tone, role, answer ' +
+      'length, or format where they conflict (including the Key beats format). Retain ' +
+      'relevant resume/profile grounding and never invent personal experience.';
   }
 
-  // Fall back to `balanced` rather than splicing `undefined` into the prompt if
-  // a stale/unvalidated style ever reaches us from the settings store.
-  const styleSuffix = STYLE_INSTRUCTIONS[answerStyle] ?? STYLE_INSTRUCTIONS.balanced;
+  // Invalid or stale values should retain the concise-first default.
+  const styleSuffix = (STYLE_INSTRUCTIONS[answerStyle] ?? STYLE_INSTRUCTIONS.brief) +
+    '\n\n' + FOLLOW_UP_INSTRUCTIONS;
   return { cachedPrefix, styleSuffix };
 }
 
 /** The whole system prompt as one string, for providers without prompt caching. */
-export function buildSystemPrompt(resume: string, jd: string, answerStyle: AnswerStyle): string {
-  const { cachedPrefix, styleSuffix } = buildSystemPromptBlocks(resume, jd, answerStyle);
+export function buildSystemPrompt(
+  resume: string,
+  jd: string,
+  answerStyle: AnswerStyle,
+  personalization: PromptPersonalization = {},
+): string {
+  const { cachedPrefix, styleSuffix } = buildSystemPromptBlocks(resume, jd, answerStyle, personalization);
   return cachedPrefix + '\n\n' + styleSuffix;
 }
 
-/** The user turn wrapped around the transcript. Kept out of the system prompt so the cached prefix stays stable. */
+/** Keep the original initial-question wrapper compatible with existing provider callers. */
 export function buildUserMessage(transcript: string): string {
   return (
     'My practice partner just asked:\n"""\n' + transcript + '\n"""\n\nWrite the model answer.'
   );
+}
+
+function buildFollowUpMessage(request: string): string {
+  return 'My follow-up request about the conversation above:\n"""\n' + request +
+    '\n"""\n\nAnswer this follow-up directly using the previous question and answer as context.';
+}
+
+/** Preserve real conversation roles so "give an example" can refer to the last answer. */
+export function buildConversationMessages(
+  transcript: string,
+  context: ConversationTurn[] = [],
+): Array<{ role: 'user' | 'assistant'; content: string }> {
+  const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  for (const [index, turn] of context.entries()) {
+    messages.push({
+      role: 'user',
+      content: index === 0 ? buildUserMessage(turn.question) : buildFollowUpMessage(turn.question),
+    });
+    messages.push({ role: 'assistant', content: turn.answer });
+  }
+  messages.push({
+    role: 'user',
+    content: context.length ? buildFollowUpMessage(transcript) : buildUserMessage(transcript),
+  });
+  return messages;
 }

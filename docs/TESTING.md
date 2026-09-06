@@ -1,7 +1,7 @@
 # Test Documentation
 
 Every test in the suite, what it verifies, and why it exists. The suite runs
-with `npm test` (vitest) — **416 tests across 11 files, no Electron and no
+with `npm test` (vitest) — **448 tests across 13 files, no Electron and no
 network required**. Electron APIs are mocked where needed (`store`), network
 protocols are driven through fakes at the wire level (a mock WebSocket for
 Deepgram, a stubbed `fetch` serving real SSE bytes for the LLM providers), and
@@ -15,19 +15,21 @@ prefixes for caching, and untrusted model output that can never become markup.
 Each entry names the failure mode it guards, so a future change that breaks a
 test can be judged against the reason the test was written.
 
-| File | Tests | Covers |
-|---|---|---|
-| `test/session.test.ts` | 42 | Session manager: lifecycle, supersession, timeouts, metrics incl. usage, the `ask()` path |
-| `test/deepgram.test.ts` | 65 | Deepgram WS client: connect races, buffering, keepalive, finalize, error contract |
-| `test/pcm.test.ts` | 21 | PCM helpers: downsampling, Int16 conversion, RMS |
-| `test/llm.test.ts` | 49 | Both LLM providers: streaming, caching layout, retries, full error-mapping matrix |
-| `test/sse.test.ts` | 32 | OpenAI-style SSE parser: chunk reassembly, tail flush, usage extraction, hostile payloads |
-| `test/prompt.test.ts` | 26 | Prompt builders: content, style handling, cache-prefix byte-stability |
-| `test/warm.test.ts` | 16 | LLM connection pre-warm: URLs, throttling, never-throws, pooling |
-| `test/markdown.test.ts` | 81 | Markdown parser + streaming DOM view: correctness, DOM reuse, XSS defence |
-| `test/store.test.ts` | 36 | Settings store: validation, secrets encryption, patch semantics, atomic writes |
-| `test/format.test.ts` | 41 | Renderer display helpers: accelerator labels, timer, errors, latency and cost chips |
-| `test/pricing.test.ts` | 7 | Pinned Anthropic pricing: per-tier rates, cache multipliers, never-guess fallback |
+| File | Covers |
+|---|---|
+| `test/session.test.ts` | Session manager: lifecycle, supersession, timeouts, metrics incl. usage, the `ask()` path |
+| `test/deepgram.test.ts` | Deepgram WS client: connect races, buffering, keepalive, finalize, error contract |
+| `test/pcm.test.ts` | PCM helpers: downsampling, Int16 conversion, RMS |
+| `test/llm.test.ts` | Both LLM providers: streaming, caching layout, retries, full error-mapping matrix |
+| `test/sse.test.ts` | OpenAI-style SSE parser: chunk reassembly, tail flush, usage extraction, hostile payloads |
+| `test/prompt.test.ts` | Prompt builders: content, style handling, cache-prefix byte-stability |
+| `test/warm.test.ts` | LLM connection pre-warm: URLs, throttling, never-throws, pooling |
+| `test/markdown.test.ts` | Markdown parser + streaming DOM view: correctness, DOM reuse, XSS defence |
+| `test/store.test.ts` | Settings store: validation, secrets encryption, patch semantics, atomic writes |
+| `test/format.test.ts` | Renderer display helpers: accelerator labels, timer, errors, latency and cost chips |
+| `test/pricing.test.ts` | Pinned Anthropic pricing: per-tier rates, cache multipliers, never-guess fallback |
+| `test/app.test.ts` | Settings forms, follow-up actions, conversation branches, incomplete-answer guards, history limits |
+| `test/ipc.test.ts` | Validated settings/context inputs and end-to-end IPC/session/provider routing |
 
 ---
 
@@ -258,7 +260,7 @@ These tests stub global `fetch` rather than mocking the `@anthropic-ai/sdk`, so 
 - **streams deltas and returns the concatenation** — OpenAI-style SSE lines produce ordered deltas and a matching return value. *Why:* same panel/history consistency contract as the Anthropic provider.
 - **does not drop the last delta when the stream ends without a trailing newline** — a truncated final `data:` line is recovered by the tail flush. *Why:* regression pin — without `parseSSETail` the last few words of an answer were silently lost.
 - **pins the model to a non-deprecated id and suppresses reasoning for latency** — asserts `openai/gpt-oss-120b` (explicitly not the shut-down `llama-3.3-70b-versatile`), `reasoning_effort: 'low'`, `include_reasoning: false`, `stream: true`. *Why:* gpt-oss is a reasoning model; left alone it thinks before speaking, spending the entire first-token budget on an empty panel.
-- **caps the completion length so a runaway answer cannot stream forever** — asserts `max_completion_tokens: 1024` in the request body. *Why:* parity with Anthropic's `MAX_TOKENS`; spoken answers are short and an uncapped completion is pure tail latency.
+- **caps the completion length so a runaway answer cannot stream forever** — asserts a 2048-token initial cap and a 4096-token cap for detailed answers or follow-ups. The budget includes hidden reasoning; prompt instructions control concision.
 - **multi-byte UTF-8 split across network chunks is reassembled, not corrupted** — delivers the body one byte at a time so every multi-byte character is split across reads; asserts the exact text survives with no U+FFFD. *Why:* pins `decoder.decode(value, {stream:true})` plus the final `decoder.decode()` flush — the provider-side half of UTF-8 safety that the parser tests cannot cover.
 - **401 maps to llm_auth** — with `401` visible in the message. *Why:* bad-key errors must be actionable and correctly labelled.
 - **403 maps to llm_auth and reports 403, not a misleading 401** — asserts the message contains `403` and not `401`. *Why:* regression pin for the fixed hardcoded "(401)" message that sent 403 users debugging the wrong thing.
@@ -324,40 +326,18 @@ The OpenAI-style SSE chunk/tail parser used by the Groq provider. Network chunks
 
 ### test/prompt.test.ts
 
-The prompt builders are pure functions, and the split between cached prefix and style suffix is the app's prompt-caching contract — several tests pin byte-level properties the cache depends on.
+Pure prompt tests cover optional resume, job description, personal profile, and
+custom instructions; factual grounding without invented experience; concise,
+balanced, and detailed policies; and explicit depth requests overriding default
+brevity. User custom instructions can override the default format and role.
 
-#### buildSystemPrompt
+The cached prefix includes saved personalization and remains byte-identical
+across length changes. Groq's concatenated system prompt matches Anthropic's
+two blocks. Invalid styles fall back to brief.
 
-- **always states the assistant role and first-person instruction** — the role and "first person" phrasing are present regardless of profile. *Why:* the model must answer as the user; losing this instruction changes the product.
-- **omits resume/JD sections and grounding clause when profile is empty** — no section headers and no grounding line for an empty profile. *Why:* empty sections would waste prefix tokens and instruct the model to ground answers in nothing.
-- **embeds the resume when provided** — the resume header, content, and grounding clause appear. *Why:* the resume is the substance of every answer; silently dropping it would produce generic answers with no error.
-- **embeds the job description when provided** — the JD header and content appear. *Why:* same as the resume, for the target role.
-- **includes both sections and the grounding clause when both are set** — full profile renders fully, including the anti-hallucination line. *Why:* "Never invent experience" is the guard against the model fabricating a career.
-- **trims whitespace-only input so it counts as empty** — whitespace resume/JD behave as absent. *Why:* a textarea full of spaces must not smuggle empty sections plus a grounding clause into the prompt.
-- **is the cached prefix followed by the style suffix** — the single-string prompt starts with `cachedPrefix` and ends with `styleSuffix`. *Why:* both providers must agree on prompt content, differing only in block structure.
-- **is exactly cachedPrefix + blank line + styleSuffix for every style** — byte-exact equality with `cachedPrefix + '\n\n' + styleSuffix` across all three styles. *Why:* startsWith/endsWith would tolerate injected bytes between the blocks, which would make the Groq (single-string) and Anthropic (two-block) prompts silently diverge.
-- **resume-only profile omits the JD section but keeps the grounding clause** — one section present, the other absent, grounding retained. *Why:* the grounding line is gated on *either* field; this pins the resume-only leg.
-- **JD-only profile omits the resume section but keeps the grounding clause** — mirror of the above. *Why:* pins the JD-only leg of the same gate.
-
-#### answerStyle
-
-- **balanced keeps v1 wording, so the default behaviour is unchanged** — the balanced instruction matches v1 verbatim. *Why:* the style feature was introduced with a compatibility promise; rewording "balanced" would change default answers.
-- **brief asks for one or two spoken sentences** — brief wording present, balanced wording absent. *Why:* each style must actually swap the instruction, not append to it.
-- **detailed asks for structured supporting points** — detailed wording present, balanced absent. *Why:* same, for the third style.
-- **every style produces a distinct, non-empty instruction** — three styles, three distinct non-empty suffixes. *Why:* two styles collapsing to the same text would make the setting a lie.
-- **an unknown style falls back to balanced instead of splicing in undefined** — a corrupt style value yields the balanced prompt with no "undefined" in it. *Why:* a stale settings file must degrade to the default, not inject the string `undefined` into a live prompt.
-- **changing the style does not change the cached prefix** — all three styles produce one identical `cachedPrefix` for the same resume/JD. *Why:* the caching invariant this app's latency story depends on — prompt caching is a prefix match, so a style-dependent prefix would mean every toggle throws away the cached resume+JD and pays a full uncached prefill.
-- **the cached prefix is byte-identical across styles for an empty profile too** — same invariant with no resume/JD. *Why:* the empty-profile branch takes a different code path through the builders; the invariant must hold there as well.
-- **an unknown style still leaves the cached prefix untouched** — the fallback affects only the suffix; prefix and suffix both equal the balanced output. *Why:* if the fallback ever leaked into the prefix, a corrupt settings file would silently invalidate the cache.
-- **the style instruction is not duplicated into the cached prefix** — the suffix text does not appear inside the prefix. *Why:* duplication would burn prefix tokens and let a stale cached style contradict the live one.
-- **the resume and JD stay in the cached prefix, not the style suffix** — profile content is only in the prefix; the suffix carries none of it. *Why:* profile text in the suffix would be re-billed uncached on every request, defeating the split.
-
-#### buildUserMessage
-
-- **wraps the transcript and asks for the model answer** — the transcript is embedded and the closing instruction present. *Why:* the basic user-turn contract.
-- **produces the exact wrapping format** — byte-exact equality with `'My practice partner just asked:\n"""\n' + transcript + '\n"""\n\nWrite the model answer.'`. *Why:* the user turn ships with every request; silent wording drift would change token counts and model behaviour with no failing test.
-- **passes the transcript through verbatim, including newlines and quotes** — a multi-line transcript with quote characters survives unescaped. *Why:* the wrapper must never mangle what the practice partner actually said.
-- **does not carry the answer style, so the user turn stays cache-neutral** — no style vocabulary in the user message. *Why:* style leaking into the user turn would bypass the carefully placed cache breakpoint.
+Conversation tests verify actual user/assistant role ordering, verbatim prior
+answers, follow-up wording, and unchanged initial-question behavior when no
+context is supplied.
 
 ### test/warm.test.ts
 
@@ -513,7 +493,7 @@ The settings store persists the profile and safeStorage-encrypted API keys. Runs
 
 #### store answerStyle and hotkey
 
-- **default to balanced and the shared DEFAULT_HOTKEY** — first-run values come from the shared constants. *Why:* the renderer and main both import `DEFAULT_HOTKEY`; the store must agree with it, not restate it.
+- **default to brief and the shared DEFAULT_HOTKEY** — first-run values come from the shared constants. *Why:* the renderer and main both import `DEFAULT_HOTKEY`; the store must agree with it, not restate it.
 - **persist across a reload** — `brief` + a custom hotkey survive a cache reset, with the hotkey trimmed. *Why:* covers the trim on save plus the disk round-trip for both fields, including `getProfile()`/`getHotkey()` consumers.
 - **an empty hotkey means "disabled" and must not spring back to the default** — `''` persists as `''`. *Why:* "no global shortcut" is a real user choice; a fallback-to-default here would re-register a hotkey the user removed.
 
@@ -648,3 +628,29 @@ tests. Documented here, grouped by file.
 - **all four buckets are summed — cache tokens are NOT inside inputTokens** — the API reports them separately. *Why:* double-counting or dropping either bucket skews every estimate silently.
 - **returns undefined for a model whose pricing is not pinned** — Groq and unknown ids. *Why:* "never guess" is the module's contract; the UI's token fallback depends on it.
 - **a zero-token answer costs exactly zero, not NaN** — degenerate input. *Why:* NaN in a template string renders `$NaN` in the chip.
+
+## Personalization and Groq verification
+
+Run `npm run test:smoke` to build and exercise the real Electron renderer,
+preload bridge, IPC handlers, encrypted settings, session manager, and Groq SSE
+provider together. The hidden window uses a temporary settings directory and
+a deterministic replacement for fetch; no real API key, model request, or
+microphone is used. The test covers settings save/reload, write-only keys,
+initial answer streaming, depth and example buttons, branching from history,
+token accounting, fresh-question reset, and preserving the concise default.
+A screenshot is written to `out/smoke-answer.png`.
+
+This verifies integration with simulated Groq responses. It does not verify
+account access, live model output quality, or real service latency. A live check
+requires saving a Groq key in Settings and asking a question.
+
+The additional unit and DOM regressions cover:
+
+- Personalization persistence, independent clearing, legacy-style preservation,
+  and invalid saved fields without losing other settings.
+- IPC validation for profile sizes, style choices, and bounded conversation turns.
+- Per-request context snapshots and no context leakage into fresh questions or recordings.
+- Original question retention plus the newest five turns in long follow-up chains.
+- Both providers' personalized request bodies and temporary depth overrides.
+- Groq streamed errors, empty responses, malformed deltas, and immediate completion
+  on `[DONE]` even if the connection remains open.
