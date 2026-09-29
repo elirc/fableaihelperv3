@@ -44,6 +44,7 @@ provider latency guarantee, cache hit rate, or real audio transcription quality.
 | `test/markdown.test.ts` | Markdown parser + streaming DOM view: correctness, DOM reuse, XSS defence, streaming invariants |
 | `test/store.test.ts` | Settings store: validation, secrets encryption, patch semantics, atomic writes, window bounds |
 | `test/bounds.test.ts` | Window-geometry sanitization: clamping, off-screen recovery, display changes |
+| `test/pricing.test.ts` | Pinned pricing, cache multipliers, and unknown-model fallback |
 | `test/format.test.ts` | Renderer display helpers: accelerator labels, timer, errors, latency strings |
 | `test/history.test.ts` | Renderer history + state-descriptor modules: live-entry lifecycle, trim, cursor math, per-state UI |
 | `test/app.test.ts` | Renderer app glue against real markup: ask/record flows, stale-event filtering, history nav, settings |
@@ -206,7 +207,7 @@ The IPC layer is the boundary between the untrusted renderer and the session pip
 
 #### parseDeepgramMessage
 
-- **extracts an interim transcript** — a `Results` frame with `is_final: false` decodes to `{ transcript, isFinal: false }`. *Why:* interims are what make the transcript render live while the other person is still speaking.
+- **extracts an interim transcript** — a `Results` frame with `is_final: false` decodes to `{ transcript, isFinal: false }`. *Why:* interims are what make the transcript render live while the practice partner is still speaking.
 - **extracts a final transcript** — a `Results` frame with `is_final: true` decodes with `isFinal: true`. *Why:* finals mark committed text; downstream logic (accumulation, UI styling) keys off this flag.
 - **returns an empty final so callers can clear the interim** — an empty-transcript final is returned, not swallowed. *Why:* an empty final is Deepgram's way of closing out a silent stretch; callers need it to clear a stale interim.
 - **ignores Metadata and other non-Results messages** — `Metadata`, `UtteranceEnd`, `SpeechStarted` all return null. *Why:* Deepgram interleaves housekeeping frames with transcripts; treating one as speech would corrupt the transcript.
@@ -379,8 +380,8 @@ These tests stub global `fetch` rather than mocking the `@anthropic-ai/sdk`, so 
 
 - **streams deltas and returns the concatenation** — OpenAI-style SSE lines produce ordered deltas and a matching return value. *Why:* same panel/history consistency contract as the Anthropic provider.
 - **does not drop the last delta when the stream ends without a trailing newline** — a truncated final `data:` line is recovered by the tail flush. *Why:* regression pin — without `parseSSETail` the last few words of an answer were silently lost.
-- **pins the model to a non-deprecated id and suppresses reasoning for latency** — asserts `openai/gpt-oss-120b` (explicitly not the shut-down `llama-3.3-70b-versatile`), `reasoning_effort: 'low'`, `include_reasoning: false`, `stream: true`. *Why:* gpt-oss is a reasoning model; left alone it thinks before speaking, spending the entire first-token budget on an empty panel.
-- **caps the completion length so a runaway answer cannot stream forever** — asserts `max_completion_tokens: 1024` in the request body. *Why:* parity with Anthropic's `MAX_TOKENS`; spoken answers are short and an uncapped completion is pure tail latency.
+- **uses the default public model and suppresses reasoning for latency** — asserts `openai/gpt-oss-120b` (explicitly not the shut-down `llama-3.3-70b-versatile`), `reasoning_effort: 'low'`, `include_reasoning: false`, `stream: true`. *Why:* gpt-oss is a reasoning model; left alone it thinks before speaking, spending the entire first-token budget on an empty panel.
+- **caps completion length with room for hidden reasoning and visible answer text** — asserts a 2048-token initial cap and a 4096-token cap for detailed answers or follow-ups. The budget includes hidden reasoning; prompt instructions control concision.
 - **multi-byte UTF-8 split across network chunks is reassembled, not corrupted** — delivers the body one byte at a time so every multi-byte character is split across reads; asserts the exact text survives with no U+FFFD. *Why:* pins `decoder.decode(value, {stream:true})` plus the final `decoder.decode()` flush — the provider-side half of UTF-8 safety that the parser tests cannot cover.
 - **401 maps to llm_auth** — with `401` visible in the message. *Why:* bad-key errors must be actionable and correctly labelled.
 - **403 maps to llm_auth and reports 403, not a misleading 401** — asserts the message contains `403` and not `401`. *Why:* regression pin for the fixed hardcoded "(401)" message that sent 403 users debugging the wrong thing.
@@ -680,7 +681,7 @@ The settings store persists the profile and safeStorage-encrypted API keys. Runs
 - **no plaintext and no ciphertext ever appears in the renderer view** — with all three keys set, the serialized view contains no plaintext, no `enc:`/`plain:` blob, and no `secrets` field at all. *Why:* the strongest form of the write-only guarantee, checked against the exact object the renderer receives.
 - **falls back to marked plaintext when the OS keystore is unavailable** — with encryption unavailable, the stored value carries the `plain:` marker and still round-trips. *Why:* the degraded path must stay functional and honestly labeled, so real encryption is distinguishable on disk.
 - **a plain: fallback key still reads after the keystore comes back** — a key saved during a keystore outage decrypts after availability returns. *Why:* the stored prefix, not the keystore's current availability, must select the decode path; keying on availability would silently vanish the key on the next launch.
-- **getProfile exposes exactly the prompt inputs — never key material** — the profile has exactly four keys and no key material in its serialization. *Why:* getProfile feeds the prompt builders, whose output goes into network request bodies; a leak here would ship the key to the wrong provider.
+- **getProfile exposes exactly the prompt inputs — never key material** — the profile contains only the expected prompt inputs and model selections, with no key material in its serialization. *Why:* getProfile feeds the prompt builders, whose output goes into network request bodies; a leak here would ship the key to the wrong provider.
 
 #### store patch semantics
 
@@ -691,7 +692,7 @@ The settings store persists the profile and safeStorage-encrypted API keys. Runs
 
 #### store answerStyle and hotkey
 
-- **default to balanced and the shared DEFAULT_HOTKEY** — first-run values come from the shared constants. *Why:* the renderer and main both import `DEFAULT_HOTKEY`; the store must agree with it, not restate it.
+- **default to brief and the shared DEFAULT_HOTKEY** — first-run values come from the shared constants. *Why:* the renderer and main both import `DEFAULT_HOTKEY`; the store must agree with it, not restate it.
 - **persist across a reload** — `brief` + a custom hotkey survive a cache reset, with the hotkey trimmed. *Why:* covers the trim on save plus the disk round-trip for both fields, including `getProfile()`/`getHotkey()` consumers.
 - **an empty hotkey means "disabled" and must not spring back to the default** — `''` persists as `''`. *Why:* "no global shortcut" is a real user choice; a fallback-to-default here would re-register a hotkey the user removed.
 - **a whitespace-only hotkey saves as "" (disabled), not as raw spaces** — `'   '` persists and reloads as `''`. *Why:* main.ts treats `''` as deliberately disabled; raw spaces would be handed to `globalShortcut.register`, which throws on the malformed accelerator and reports a failure the user never asked for.
@@ -1067,3 +1068,154 @@ within the minimum viewport. It captures `default-main.png` at 460x700 and `mini
 the automatic assertions do not establish accessibility completeness, actual
 screen-capture exclusion, real provider performance, or live transcription
 quality.
+
+---
+
+## Practice-mode rework additions (2026-08-20)
+
+The practice-mode conversion (mock-interview coaching prompt, mic/system audio
+source, per-provider model picker, and per-answer usage/cost reporting) has
+additional coverage documented here, grouped by file. The context-specific
+prompt tests above supersede the older interview-only prompt assertions.
+
+### test/sse.test.ts
+
+- **surfaces the usage object from a final chunk** — `parseSSEChunk` returns `usage` alongside deltas. *Why:* the cost chip is fed from here; dropping the final chunk's accounting silently blanks it.
+- **omits the usage key entirely when no chunk carried one** — key-absence, not `undefined`. *Why:* callers compare whole results; a phantom key breaks exact assertions and JSON round-trips.
+- **reads Groq's x_groq mirror when the top-level usage is absent** — provider quirk cover. *Why:* Groq has shipped usage in both places across API versions.
+- **the last usage seen wins when several chunks carry one** — later chunks are cumulative. *Why:* summing would double-count.
+- **recovers usage from an unterminated tail line** — `parseSSETail` flushes usage exactly like it flushes the last delta. *Why:* the usage chunk is the *last* line, so it is the one most likely to arrive without a trailing newline.
+- **a non-object usage value is ignored** — hostile/malformed payload guard. *Why:* the parser's contract is "never crash the stream".
+
+### test/llm.test.ts
+
+- **anthropic: the default model sends NO thinking parameter (Haiku predates it)** — Haiku 4.5 gets no `thinking` config. *Why:* Haiku never thinks unless asked; sending config it doesn't need risks 400s on API drift.
+- **anthropic: a model override reaches the body and disables default-on thinking** — Sonnet 5 / Opus 5 get `thinking: {type: 'disabled'}`. *Why:* those models think *by default*, and unprompted thinking spends the stop-to-first-token budget this app exists to protect.
+- **anthropic: reports usage with a cost estimate for a pinned-pricing model** — `onUsage` receives model, four token buckets, and a cost matching the pinned rates. *Why:* the whole model-comparison feature rests on these numbers being real.
+- **groq: asks for usage accounting on the final chunk** — `stream_options.include_usage` is sent. *Why:* without it Groq reports nothing and the chip never shows.
+- **groq: a non-reasoning model gets no reasoning params (it would reject them)** — the llama pick omits `reasoning_effort`/`include_reasoning`. *Why:* non-reasoning models reject those params; the picker must not brick a model choice.
+- **groq: usage from the final chunk reaches onUsage — tokens only, no invented cost** — `estCostUsd` absent. *Why:* Groq pricing is deliberately not pinned; a guessed dollar figure is worse than none.
+- **groq: a stream with no usage chunk simply never calls onUsage** — absence is not an error. *Why:* usage is best-effort telemetry; its absence must never fail an answer.
+
+### test/session.test.ts
+
+- **usage reported by the provider lands on the done metrics** — recorded-session path. *Why:* the chip renders from `metrics.usage`; a broken thread loses the feature invisibly.
+- **ask() sessions carry usage too** — typed-question path. *Why:* Regenerate (the model-comparison gesture) goes through `ask()`.
+- **a provider that reports no usage produces metrics WITHOUT a usage key** — key-absence pinned. *Why:* `usage: undefined` survives `toEqual` but breaks key-iterating consumers; the conditional spread in session.ts is deliberate.
+
+### test/store.test.ts
+
+- **new-install brevity agrees across legacy style, output defaults, and the Interview profile**: A new installation uses brief consistently; a migrated shared balanced default cannot override it silently.
+- **migrating personalized settings preserves explicit style and global text beside scenario drafts**: Existing personalized text, explicit style, audio source, and model choices survive the addition and saving of scenario profiles.
+- **upgrading keeps an explicitly saved answer style**: The new brief default does not rewrite existing balanced/detailed settings or lose saved credentials when personalization fields are introduced.
+- **profile and custom instructions can be edited and cleared independently**: Clearing one global personalization field leaves the other intact across a reload.
+- **invalid saved personalization fields do not discard other settings**: Malformed or oversized global fields fall back independently while valid references and style remain.
+- **defaults: microphone source and the latency-first models** — new-install defaults. *Why:* the defaults ARE the product posture: practice partner in the room, fastest model.
+- **a settings.json written before these fields existed falls back to the defaults** — v2.0 files load clean. *Why:* the rework must not brick an existing settings file (which also holds the encrypted keys).
+- **patched values persist and reach getProfile** — round-trip through disk, and `getProfile` (which feeds provider construction) carries the model picks. *Why:* a picker that saves but doesn't reach the request is a silent lie.
+- **a model no longer in the curated list falls back instead of failing the file** — per-field `catch` semantics extended to the new enums. *Why:* retiring a model from the list in a future version must cost the user one dropdown value, not their resume.
+
+### test/format.test.ts
+
+- **empty when the provider reported no usage** — chip hides itself. *Why:* an empty chip rendering `"undefined"` is the classic formatter failure.
+- **shows dollars to four decimals when a cost estimate exists** / **four decimals keep sub-cent answers visible** — `$0.0030`, `$0.0004`. *Why:* two decimals would render every Haiku answer as `$0.00` and the comparison would teach nothing.
+- **falls back to a token count when pricing is not pinned (Groq)** — `1500→300 tok`. *Why:* honest fallback, pinned format.
+- **token fallback counts cached tokens as input** — cache reads/writes were real prompt tokens. *Why:* omitting them would understate counts if caching ever lands on that path.
+- **title names the model and the in/out split** — hover breakdown. *Why:* the chip is the headline; the title is where the comparison data lives.
+- **title mentions cache lines only when caching actually engaged** — zeros suppressed. *Why:* a wall of zeros buries the one number that matters (cache reads prove the prefix cache engaged — see README).
+- **title explains an absent estimate instead of leaving a bare token count** — "pricing not pinned". *Why:* an unexplained missing dollar figure reads as a bug.
+
+### test/pricing.test.ts
+
+- **prices a typical Haiku answer (the default model) correctly** — 1500 in / 300 out = $0.003. *Why:* the README quotes this number; the code must agree with it.
+- **scales with the model tier** — $1/$3/$5 per MTok input across Haiku/Sonnet/Opus. *Why:* the tier ratio is the entire point of the comparison feature.
+- **output tokens are priced at the output rate** — 5x input on every tier. *Why:* swapping the rates is the likeliest single-character bug in a pricing table.
+- **cache reads bill at 0.1x input and writes at 1.25x** — Anthropic's uniform multipliers. *Why:* cache economics justify the two-block prompt; wrong multipliers misreport the payoff.
+- **all four buckets are summed — cache tokens are NOT inside inputTokens** — the API reports them separately. *Why:* double-counting or dropping either bucket skews every estimate silently.
+- **returns undefined for a model whose pricing is not pinned** — Groq and unknown ids. *Why:* "never guess" is the module's contract; the UI's token fallback depends on it.
+- **a zero-token answer costs exactly zero, not NaN** — degenerate input. *Why:* NaN in a template string renders `$NaN` in the chip.
+
+## Personalization and Groq verification
+
+Run `npm run test:smoke` to build and exercise the real Electron renderer,
+preload bridge, IPC handlers, encrypted settings, session manager, and Groq SSE
+provider together. The hidden window uses a temporary settings directory and
+a deterministic replacement for fetch; no real API key, model request, or
+microphone is used. The test covers settings save/reload, write-only keys,
+initial answer streaming, depth and example buttons, branching from history,
+token accounting, explicit one-shot follow-ups, independent fresh questions,
+and preserving the concise default. The real provider request is asserted as
+one system message and one user message with labeled JSON reference data;
+prior generated answers are never promoted into trusted assistant-role history.
+Chromium network requests are blocked in addition to replacing main-process
+fetch. A screenshot is written to `out/smoke-answer.png`. The Node launcher
+removes only its checked temporary directory under `out` after Electron exits,
+so Windows releases Chromium cache handles before cleanup.
+
+This verifies integration with simulated Groq responses. It does not verify
+account access, live model output quality, or real service latency. A live check
+requires saving a Groq key in Settings and asking a question.
+
+The additional unit and DOM regressions cover:
+
+- Personalization persistence, independent clearing, legacy-style preservation,
+  and invalid saved fields without losing other settings.
+- IPC validation for profile sizes, style choices, and bounded conversation turns.
+- Per-request context snapshots and no context leakage into fresh questions or recordings.
+- Original question retention plus the newest five turns in long follow-up chains.
+- Both providers' personalized request bodies and temporary depth overrides.
+- Groq streamed errors, empty responses, malformed deltas, and immediate completion
+  on `[DONE]` even if the connection remains open.
+
+
+## Merged personalization, model, and follow-up regressions
+
+### test/context.test.ts
+
+- **personalization and explicit conversation are captured without sharing later mutations**: Global profile text, instructions, and selected turns are deep-copied into the request and regeneration snapshot; a later independent request has no conversation.
+- **explicit output override takes precedence over the compatible answerStyle option**: The newer per-request output override wins when both compatibility and current options specify length.
+- **conversation and personalization enforce individual and combined request budgets**: Per-field limits and the overall context cap include global personalization and every selected turn, preventing otherwise valid fields from bypassing the total bound.
+
+### test/prompt.test.ts
+
+- **only interview scenarios include mock practice and Key beats coaching**: Interview practice guidance does not leak into technical, meeting, client, or custom scenarios.
+- **personal profile stays reference data while custom instructions override coaching defaults**: Factual personal material is quoted separately from explicit behavior instructions; customization remains able to change default coaching presentation.
+- **multi-turn context preserves order and explicit requests without asserting generated claims**: Ordered selected turns appear as labeled reference data, with prior generated claims treated as unconfirmed.
+- **a selected related answer already present in explicit conversation is included once**: Compatibility related-answer and conversation fields do not duplicate the same prior suggestion in the prompt.
+
+### test/session.test.ts
+
+- **passes a snapshot of context and per-answer style without leaking into later questions**: Compatibility context and temporary detailed length reach only their intended request; later questions use their own settings.
+
+### test/ipc.test.ts
+
+- **captures model and global customization at record start despite settings edits**: Provider model and global personalization are fixed before asynchronous transcription, protecting an in-flight question from later Settings saves.
+- **routes explicit multi-turn context and legacy answerStyle into a frozen snapshot**: Legacy options enter the same immutable, validated snapshot path as current request options.
+- **rejects malformed conversation without replacing a live recording**: Empty, oversized, excessive, or malformed turns fail validation while the existing recording continues.
+- **validates customization, audio source, and model settings before persistence**: Invalid personalization sizes, capture modes, and model ids cannot reach store writes.
+
+### test/llm.test.ts
+
+- **sends personalization and follow-up context while keeping style outside the cached prefix**: Anthropic receives global customization and explicit selected history without moving temporary length preferences into the stable cache block.
+- **finishes on DONE without waiting for the server to close the connection**: Groq's completion marker releases the stream immediately, preventing an open connection from consuming the total-answer deadline.
+- **gives a typed follow-up room for examples even when the saved style is brief**: Explicit follow-ups receive a sufficient bounded completion budget without changing the saved default.
+- **maps a rate-limit event received after HTTP 200**: A streamed provider error preserves the rate-limit code instead of being mistaken for a successful or empty answer.
+- **sends personalization and labeled conversation data for a detailed follow-up**: Groq forwards the selected global/profile context and ordered history in the same labeled-data contract as Anthropic.
+
+### test/sse.test.ts
+
+- **ignores non-string content instead of emitting objects as answer text**: Malformed delta values cannot become rendered answer text.
+- **surfaces an SSE error after any preceding content and stops at the error**: Earlier partial output remains available, but a provider error ends processing and rejects the answer.
+- **marks DONE and ignores any trailing content in the same chunk**: The terminal marker cannot be bypassed by extra data bytes that would append a late answer tail.
+- **surfaces an error delivered without a trailing newline**: End-of-stream error frames are parsed from the buffered tail instead of being silently lost.
+
+### test/app.test.ts
+
+- **recording defaults to microphone and saved system source uses loopback instead**: New installs use microphone capture; explicit system capture selects loopback without opening the other source.
+- **personalization and model settings load, save, snapshot and retain drafts on failure**: The selected provider enables its model control, global text and audio preferences save correctly, submitted snapshots contain personalization, and failed saves retain edits.
+- **Go deeper and examples preserve selected context with temporary detailed length**: Actions use the viewed entry's context and ordered history with detailed output, while preserving the saved brief default and rejecting concurrent actions.
+- **explicit followup chains retain anchor and recent turns and branch from the selected entry**: Bounded chains keep their originating question and recent turns, branch from the viewed answer, and do not leak into the next independent typed question.
+- **failed partial answers cannot be selected as completed followup context**: An incomplete answer remains visible but cannot be treated as a completed source for depth/example/follow-up actions.
+- **usage chip displays estimated cost or tokens honestly and follows history selection**: The chip shows pinned estimates when available, token-only fallback otherwise, and always matches the selected history entry.
+
+- **%s does not replay the source one-question note or consume the next pending note**: Go deeper and Worked example clear the source snapshot's one-shot note while preserving a newly drafted note for the next independent question.

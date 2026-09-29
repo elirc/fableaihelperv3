@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from 'vitest';
-import type { AnswerMetrics, AppError } from '../src/shared/types';
+import type { AnswerMetrics, AskOptions, ContextSnapshot, AppError } from '../src/shared/types';
 import {
   SessionManager,
   toAppError,
@@ -1222,5 +1222,85 @@ describe('terminal resource cleanup', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('SessionManager usage threading', () => {
+  const USAGE = {
+    model: 'claude-haiku-4-5',
+    inputTokens: 1500,
+    outputTokens: 300,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    estCostUsd: 0.003,
+  };
+
+  function usageLlm(): LlmProvider {
+    return {
+      async generate(_transcript, onDelta, _signal, onUsage) {
+        onDelta('answer');
+        onUsage?.(USAGE);
+        return 'answer';
+      },
+    };
+  }
+
+  test('usage reported by the provider lands on the done metrics', async () => {
+    const { log, events } = collectEvents();
+    const mgr = new SessionManager({ createStt: async () => new FakeStt(), createLlm: usageLlm, events });
+    const id = await mgr.start();
+    await mgr.stop(id);
+    const m = (log.find((e) => e.type === 'done')!.data as { metrics: AnswerMetrics }).metrics;
+    expect(m.usage).toEqual(USAGE);
+  });
+
+  test('ask() sessions carry usage too', async () => {
+    const { log, events } = collectEvents();
+    const mgr = new SessionManager({ createStt: async () => new FakeStt(), createLlm: usageLlm, events });
+    await mgr.ask('what are react hooks');
+    await until(() => log.some((e) => e.type === 'done'));
+    const m = (log.find((e) => e.type === 'done')!.data as { metrics: AnswerMetrics }).metrics;
+    expect(m.usage).toEqual(USAGE);
+  });
+
+  test('a provider that reports no usage produces metrics WITHOUT a usage key', async () => {
+    // Pinned as a key-absence check: `usage: undefined` would survive toEqual
+    // but break consumers that iterate metric keys or JSON-roundtrip them.
+    const { log, events } = collectEvents();
+    const mgr = new SessionManager({ createStt: async () => new FakeStt(), createLlm: () => fakeLlm(), events });
+    const id = await mgr.start();
+    await mgr.stop(id);
+    const m = (log.find((e) => e.type === 'done')!.data as { metrics: AnswerMetrics }).metrics;
+    expect('usage' in m).toBe(false);
+  });
+});
+
+describe('contextual follow-ups', () => {
+  test('passes a snapshot of context and per-answer style without leaking into later questions', async () => {
+    const { events, log } = collectEvents();
+    const requests: Array<ContextSnapshot | undefined> = [];
+    const manager = new SessionManager({
+      createStt: async () => new FakeStt(),
+      createLlm: (snapshot) => ({
+        async generate(_question, onDelta) {
+          requests.push(snapshot);
+          onDelta('An explanation.');
+          return 'An explanation.';
+        },
+      }),
+      events,
+    });
+    const options: AskOptions = { context: [{ question: 'What is a cache?', answer: 'A store for reused results.' }], answerStyle: 'detailed' };
+    await manager.ask('Show an example.', options);
+    options.context![0]!.answer = 'Changed after asking';
+    options.answerStyle = 'brief';
+    await until(() => log.some((event) => event.type === 'done'));
+    expect(requests[0]).toMatchObject({ conversation: [{ question: 'What is a cache?', answer: 'A store for reused results.' }], output: { answerStyle: 'detailed' } });
+    await manager.ask('A separate question');
+    await until(() => log.filter((event) => event.type === 'done').length === 2);
+    expect(requests[1]).toBeUndefined();
+    const id = await manager.start();
+    await manager.stop(id);
+    expect(requests[2]).toBeUndefined();
   });
 });

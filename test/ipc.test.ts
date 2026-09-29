@@ -15,6 +15,8 @@ const mocked = vi.hoisted(() => ({
   profile: {
     resume: 'my resume',
     jobDescription: 'the jd',
+    personalProfile: '', customInstructions: '',
+    anthropicModel: 'claude-haiku-4-5', groqModel: 'openai/gpt-oss-120b',
     llmProvider: 'anthropic' as string,
     answerStyle: 'balanced' as string,
   },
@@ -162,6 +164,8 @@ beforeEach(() => {
   mocked.profile = {
     resume: 'my resume',
     jobDescription: 'the jd',
+    personalProfile: '', customInstructions: '',
+    anthropicModel: 'claude-haiku-4-5', groqModel: 'openai/gpt-oss-120b',
     llmProvider: 'anthropic',
     answerStyle: 'balanced',
   };
@@ -424,7 +428,7 @@ describe('ipc session:stop', () => {
     // key, resume, jd, style — the whole grounding context for the answer.
     expect(anthropicArgs).toEqual([['ant-key', expect.objectContaining({
       resume: 'my resume', jobDescription: 'the jd', output: expect.objectContaining({ answerStyle: 'balanced' }),
-    })]]);
+    }), 'claude-haiku-4-5']]);
     expect(llm.prompts).toEqual(['What is your greatest strength?']);
   });
 
@@ -587,6 +591,64 @@ describe('ipc context requests', () => {
       await expect(invoke('settings:set', { contextProfiles })).rejects.toThrow();
     }
     await expect(invoke('settings:set', { outputDefaults: { ...DEFAULT_OUTPUT, format: 'invalid' } })).rejects.toThrow();
+    expect(mocked.patches).toHaveLength(1);
+  });
+});
+
+describe('merged personalization, model, and conversation requests', () => {
+  test('captures model and global customization at record start despite settings edits', async () => {
+    mocked.profile.anthropicModel = 'claude-sonnet-5';
+    mocked.profile.personalProfile = 'Python developer';
+    mocked.profile.customInstructions = 'Use practical examples';
+    await setup();
+    const id = await startedSession();
+    mocked.profile.anthropicModel = 'claude-opus-5';
+    mocked.profile.personalProfile = 'Edited profile';
+    mocked.profile.customInstructions = 'Edited instructions';
+    await invoke('session:stop', id);
+    expect(anthropicArgs[0]).toEqual(['ant-key', expect.objectContaining({
+      personalProfile: 'Python developer', customInstructions: 'Use practical examples',
+    }), 'claude-sonnet-5']);
+    expect(sentOn('llm:done')[0]?.context).toMatchObject({ personalProfile: 'Python developer', customInstructions: 'Use practical examples' });
+  });
+
+  test('routes explicit multi-turn context and legacy answerStyle into a frozen snapshot', async () => {
+    await setup();
+    const context = [{ question: 'What is caching?', answer: 'Reuse stored results.' }, { question: 'Give an example', answer: 'Cache an API response.' }];
+    await invoke('session:ask', 'Show Python code', { context, answerStyle: 'detailed' });
+    context[0]!.answer = 'Mutated after request';
+    await vi.waitFor(() => expect(sentOn('llm:done')).toHaveLength(1));
+    expect(anthropicArgs[0]?.[1]).toMatchObject({ conversation: [
+      { question: 'What is caching?', answer: 'Reuse stored results.' },
+      { question: 'Give an example', answer: 'Cache an API response.' },
+    ], output: { answerStyle: 'detailed' } });
+    expect(Object.isFrozen((anthropicArgs[0]?.[1] as { conversation: unknown }).conversation)).toBe(true);
+  });
+
+  test('rejects malformed conversation without replacing a live recording', async () => {
+    await setup();
+    await startedSession();
+    for (const options of [
+      { context: [{ question: 'Question', answer: '' }] },
+      { context: Array.from({ length: 7 }, () => ({ question: 'Q', answer: 'A' })) },
+      { context: [{ question: 'Q', answer: 'x'.repeat(20001) }] },
+      { answerStyle: 'invalid' },
+    ]) {
+      expect(await invoke('session:ask', 'Explain more', options)).toMatchObject({ ok: false });
+    }
+    expect(stt.aborted).toBe(false);
+    expect(anthropicArgs).toEqual([]);
+  });
+
+  test('validates customization, audio source, and model settings before persistence', async () => {
+    await setup();
+    const patch = { personalProfile: 'Engineer', customInstructions: 'Use Python', audioSource: 'microphone', anthropicModel: 'claude-sonnet-5', groqModel: 'llama-3.1-8b-instant' };
+    await invoke('settings:set', patch);
+    expect(mocked.patches).toEqual([patch]);
+    for (const invalid of [
+      { personalProfile: 'x'.repeat(12001) }, { customInstructions: 'x'.repeat(8001) },
+      { audioSource: 'camera' }, { anthropicModel: 'arbitrary' }, { groqModel: 'arbitrary' },
+    ]) await expect(invoke('settings:set', invalid)).rejects.toThrow();
     expect(mocked.patches).toHaveLength(1);
   });
 });

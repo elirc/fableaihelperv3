@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'" />
-  <title>AI Call Assistant</title>
+  <title>Interview Practice Partner</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <header>
     <div class="brand">
       <span class="dot" id="statusDot" aria-hidden="true"></span>
-      <h1>AI Call Assistant</h1>
+      <h1>Interview Practice Partner</h1>
     </div>
     <button id="settingsBtn" class="icon-btn" type="button" aria-label="Settings" title="Settings">
       <span aria-hidden="true">&#9881;</span>
@@ -18,7 +18,7 @@
   </header>
 
   <main id="mainView">
-    <div class="status" id="statusText" role="status">Ready — press Record while the other person is speaking</div>
+    <div class="status" id="statusText" role="status">Ready — press Record while your practice partner asks a question</div>
 
     <button id="recordBtn" class="record-btn" type="button">
       <span class="rec-icon" aria-hidden="true"></span>
@@ -98,20 +98,22 @@
 
     <section class="panel grow" aria-labelledby="answerTitle">
       <div class="panel-title">
-        <span id="answerTitle">Suggested answer</span>
+        <span id="answerTitle">Model answer</span>
         <span class="gen-tag" id="genTag" hidden>generating…</span>
         <span class="latency" id="latencyTag" hidden></span>
+        <span class="cost" id="costTag" hidden></span>
         <div class="title-actions">
           <button id="regenBtn" class="mini-btn" type="button" aria-label="Regenerate answer with original context" hidden><span aria-hidden="true">&#8635;</span> Original context</button>
           <button id="copyBtn" class="mini-btn" type="button" aria-label="Copy answer" hidden><span id="copyLabel">Copy</span></button>
         </div>
       </div>
-      <div class="panel-body md" id="answerBox" aria-live="polite" aria-atomic="false" tabindex="0"><span class="placeholder">Your AI-suggested answer will stream here.</span></div>
+      <div class="panel-body md" id="answerBox" aria-live="polite" aria-atomic="false" tabindex="0"><span class="placeholder">The model answer to practise against will stream here.</span></div>
       <details id="entryContext" class="entry-context" hidden><summary>Context used for this answer</summary><pre id="entryContextText"></pre></details>
       <details id="answerActions" class="answer-actions" hidden>
         <summary>Refine or follow up</summary>
         <div class="context-actions" role="group" aria-label="Refine selected answer">
         <button id="regenCurrentBtn" type="button">Regenerate with current context</button>
+        <button id="deeperBtn" type="button">Go deeper</button><button id="exampleBtn" type="button">Worked example</button>
         <button id="shorterBtn" type="button">Shorter</button><button id="specificBtn" type="button">More specific</button>
         <label class="sr-only" for="refineTone">New answer tone</label><select id="refineTone"><option value="diplomatic">Diplomatic</option><option value="confident">Confident</option><option value="conversational">Conversational</option></select><button id="toneBtn" type="button">Change tone</button>
         <button id="editQuestionBtn" type="button">Edit question &amp; answer again</button><button id="followupBtn" type="button">Follow up on this entry</button>
@@ -127,14 +129,34 @@
 
     <div class="error" id="settingsError" role="alert" hidden></div>
 
+    <label for="audioSource">Question audio source</label>
+    <select id="audioSource">
+      <option value="microphone">Microphone — a partner asking questions in the room</option>
+      <option value="system">System audio — sound this PC is playing (call, video, recording)</option>
+    </select>
+
     <label for="deepgramKey">Deepgram API key <span class="hint">(live transcription) — <a href="https://console.deepgram.com/" target="_blank" rel="noreferrer">get one</a></span></label>
     <input type="password" id="deepgramKey" autocomplete="off" />
     <label class="check"><input id="clearDeepgramKey" type="checkbox" /> Clear saved Deepgram key on Save</label>
 
-    <label for="llmProvider">Answer model</label>
+    <label for="llmProvider">Answer provider</label>
     <select id="llmProvider">
-      <option value="anthropic">Claude Haiku 4.5 (recommended)</option>
-      <option value="groq">Groq GPT-OSS 120B (fastest)</option>
+      <option value="anthropic">Anthropic Claude (recommended)</option>
+      <option value="groq">Groq (fastest)</option>
+    </select>
+
+    <label for="anthropicModel">Claude model <span class="hint">(latency/cost trade — the cost chip shows the real numbers)</span></label>
+    <select id="anthropicModel">
+      <option value="claude-haiku-4-5">Haiku 4.5 — fastest, $1/$5 per MTok (default)</option>
+      <option value="claude-sonnet-5">Sonnet 5 — stronger writing, $3/$15 per MTok</option>
+      <option value="claude-opus-5">Opus 5 — strongest, $5/$25 per MTok</option>
+    </select>
+
+    <label for="groqModel">Groq model <span class="hint">(pricing not pinned — the chip shows tokens)</span></label>
+    <select id="groqModel">
+      <option value="openai/gpt-oss-120b">GPT-OSS 120B — default, ~500 tok/s</option>
+      <option value="openai/gpt-oss-20b">GPT-OSS 20B — smaller, faster</option>
+      <option value="llama-3.1-8b-instant">Llama 3.1 8B Instant — Enterprise access</option>
     </select>
 
     <label for="anthropicKey">Anthropic API key <span class="hint"><a href="https://platform.claude.com/" target="_blank" rel="noreferrer">get one</a></span></label>
@@ -158,6 +180,14 @@
       Combine Ctrl, Alt, Shift or Super with a key, e.g.
       <code>CommandOrControl+Shift+Space</code>. Leave empty to turn the shortcut off.
     </p>
+
+    <label for="personalProfile">Personal profile</label>
+    <textarea id="personalProfile" rows="5" maxlength="12000" aria-describedby="profileHelp" placeholder="Role: junior backend developer. Experience: 2 years with Python. Goal: prepare for senior interviews. I learn best from practical API examples."></textarea>
+    <p class="hint" id="profileHelp">Share your role, experience level, goals, and preferred examples to make answers more relevant. Up to 12,000 characters.</p>
+
+    <label for="customInstructions">System prompt customization</label>
+    <textarea id="customInstructions" rows="5" maxlength="8000" aria-describedby="instructionsHelp" placeholder="Use a direct, friendly tone. Lead with the answer, then explain why. Emphasize tradeoffs. Use Python for code examples. When I ask for more detail, walk through a concrete example."></textarea>
+    <p class="hint" id="instructionsHelp">Add instructions for tone, emphasis, structure, or examples. These supplement the app's default guidance and apply to future answers. Up to 8,000 characters.</p>
 
     <label for="resume">Your resume <span class="hint">(paste as plain text)</span></label>
     <textarea id="resume" rows="7" placeholder="Paste your resume here so answers match your background..."></textarea>

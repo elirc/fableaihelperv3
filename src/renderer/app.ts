@@ -1,15 +1,15 @@
-import { DEFAULT_HOTKEY } from '../shared/types';
+import { ANTHROPIC_MODELS, DEFAULT_ANTHROPIC_MODEL, DEFAULT_GROQ_MODEL, DEFAULT_HOTKEY, GROQ_MODELS } from '../shared/types';
 import { createDefaultProfile, createProfile, resolveContext, cloneContext, boundRelatedAnswer, DEFAULT_OUTPUT, CONTEXT_LIMITS } from '../shared/context';
 import type {
   ContextSnapshot, ScenarioProfile, Situation, RelatedAnswer, OutputPreferences,
-  AnswerStyle,
+  AnswerStyle, AnthropicModelId, GroqModelId, AudioSource, ConversationTurn,
   LlmProviderId,
   RendererApi,
   Result,
   SettingsPatch,
   SettingsView,
 } from '../shared/types';
-import { errorMessage, formatAccelerator, formatTimer, latencyLabel, latencyTitle } from './format';
+import { costLabel, costTitle, errorMessage, formatAccelerator, formatTimer, latencyLabel, latencyTitle } from './format';
 import { createHistory } from './history';
 import { createMarkdownView } from './markdown';
 import { stateUi } from './ui-state';
@@ -60,8 +60,8 @@ const settingsHeading = $('settingsHeading');
 const MAX_SECONDS = 120; // safety cap per clip
 const MAX_HISTORY = 6; // Q/A pairs kept in memory
 const MAX_PENDING_FRAMES = 120; // ~15 s of audio buffered while the session opens
-const BASE_READY_TEXT = 'Ready — press Record while the other person is speaking';
-const ANSWER_PLACEHOLDER = 'Your AI-suggested answer will stream here.';
+const BASE_READY_TEXT = 'Ready — press Record while your practice partner asks a question';
+const ANSWER_PLACEHOLDER = 'The model answer to practise against will stream here.';
 const TRANSCRIPT_PLACEHOLDER = 'The live transcript will appear here while you record.';
 
 const answerView = createMarkdownView(answerBox);
@@ -77,6 +77,7 @@ let recordStart = 0;
 let timerInterval: ReturnType<typeof setInterval> | null = null;
 let hotkeyLabel = '';
 let hotkeyActive = false;
+let audioSource: AudioSource = 'microphone';
 
 const history = createHistory(MAX_HISTORY);
 let settingsCache: SettingsView | null = null;
@@ -85,6 +86,7 @@ let profileBusy = false;
 let profiles: ScenarioProfile[] = [createDefaultProfile()];
 let activeProfileId = profiles[0]!.id;
 let pendingFollowup: RelatedAnswer | undefined;
+let pendingConversation: ConversationTurn[] | undefined;
 let requestFollowup: RelatedAnswer | undefined;
 let editingContext: ContextSnapshot | undefined;
 let noteRevision = 0;
@@ -122,9 +124,10 @@ function currentContext(): ContextSnapshot {
     alwaysOnTop: false, llmProvider: 'anthropic', hotkey: '', hotkeyRegistered: false,
     hasDeepgramKey: false, hasAnthropicKey: false, hasGroqKey: false,
     resume: settingsCache?.resume ?? '', jobDescription: settingsCache?.jobDescription ?? '',
+    personalProfile: settingsCache?.personalProfile ?? '', customInstructions: settingsCache?.customInstructions ?? '',
     answerStyle: settingsCache?.answerStyle ?? 'balanced', outputDefaults: settingsCache?.outputDefaults,
     contextProfiles: profiles, activeProfileId,
-  }, { questionNote: noteInput.value, followUp: pendingFollowup });
+  }, { questionNote: noteInput.value, followUp: pendingFollowup, context: pendingConversation });
 }
 
 function requestContext(snapshot?: ContextSnapshot): ContextSnapshot {
@@ -138,7 +141,7 @@ function syncContextSummary(): void {
   const p = activeProfile();
   const output = { ...DEFAULT_OUTPUT, answerStyle: settingsCache?.answerStyle ?? 'balanced', ...settingsCache?.outputDefaults, ...p.output };
   $('contextSummary').textContent = `${p.name} · ${output.answerStyle}${noteInput.value ? ' · note' : ''}`;
-  $('contextSummary').title = `${p.situation} · ${output.format} · ${output.tone} · ${output.audience}${p.background ? ' · background' : ''}${p.includeResume ? ' · resume included' : ''}${p.includeJobDescription ? ' · job description included' : ''}${p.instructions ? ' · instructions set' : ''}`;
+  $('contextSummary').title = `${p.situation} · ${output.format} · ${output.tone} · ${output.audience}${p.background ? ' · background' : ''}${p.includeResume ? ' · resume included' : ''}${p.includeJobDescription ? ' · job description included' : ''}${p.instructions ? ' · instructions set' : ''}${settingsCache?.personalProfile ? ' · personal profile' : ''}${settingsCache?.customInstructions ? ' · global instructions' : ''}`;
   $('contextTiming').textContent = state === 'idle'
     ? 'Changes apply when you next press Record or Ask. Profiles are saved only with Save profile.'
     : 'This answer uses its captured context. Changes apply to the next question.';
@@ -168,6 +171,7 @@ function fillContextForm(): void {
 
 function loadContextSettings(settings: SettingsView): void {
   settingsCache = settings;
+  audioSource = settings.audioSource ?? 'microphone';
   profiles = settings.contextProfiles?.length ? settings.contextProfiles.map((p) => ({ ...p, output: { ...p.output } })) : [createDefaultProfile(settings.answerStyle)];
   activeProfileId = settings.activeProfileId ?? profiles[0]!.id;
   if (!profiles.some((p) => p.id === activeProfileId)) activeProfileId = profiles[0]!.id;
@@ -253,7 +257,7 @@ $('applyTemplate').addEventListener('click', () => {
   field.value = [field.value.trim(), template].filter(Boolean).join('\n').slice(0, CONTEXT_LIMITS.instructions);
   field.dispatchEvent(new Event('input'));
 });
-$('cancelFollowup').addEventListener('click', () => { pendingFollowup = undefined; $('followupBanner').hidden = true; });
+$('cancelFollowup').addEventListener('click', () => { pendingFollowup = undefined; pendingConversation = undefined; $('followupBanner').hidden = true; });
 $('cancelEditQuestion').addEventListener('click', () => { editingContext = undefined; $('editBanner').hidden = true; });
 
 const readyText = (): string =>
@@ -270,21 +274,51 @@ interface Capture {
  * that loses a race can never stop the capture of the run that replaced it.
  */
 async function startCapture(onFrame: (pcm: ArrayBuffer, rms: number) => void): Promise<Capture> {
-  // getDisplayMedia is routed to system-audio loopback by the main process.
-  // Prefer audio-only; fall back to the discarded-video workaround if the
-  // Electron version insists on a video track.
   let stream: MediaStream;
-  try {
-    stream = await navigator.mediaDevices.getDisplayMedia({ video: false, audio: true } as MediaStreamConstraints);
-  } catch {
-    stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-    stream.getVideoTracks().forEach((t) => t.stop());
+  if (audioSource === 'system') {
+    // getDisplayMedia is routed to system-audio loopback by the main process.
+    // Prefer audio-only; fall back to the discarded-video workaround if the
+    // Electron version insists on a video track.
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: false, audio: true } as MediaStreamConstraints);
+    } catch {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      stream.getVideoTracks().forEach((t) => t.stop());
+    }
+  } else {
+    // Practice-partner-in-the-room default. Echo cancellation and noise
+    // suppression stay on: the partner's voice is the signal, and any audio
+    // this PC plays (including a re-read of an earlier answer) is noise.
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (err) {
+      // First-run mic failures are exactly where a specific hint pays off:
+      // "permission denied" and "no device" send the user to different places.
+      const name = err instanceof DOMException ? err.name : '';
+      if (name === 'NotAllowedError') {
+        throw new Error(
+          'Microphone access is blocked. Allow it in Windows Settings > Privacy & security > Microphone, then try again.',
+        );
+      }
+      if (name === 'NotFoundError') {
+        throw new Error('No microphone found. Plug one in, or pick a different input device in Windows sound settings.');
+      }
+      throw new Error(
+        'Could not open the microphone. Check Windows microphone permissions for this app, or switch the audio source in Settings.',
+      );
+    }
   }
 
   const audioTracks = stream.getAudioTracks();
   if (audioTracks.length === 0) {
     stream.getTracks().forEach((t) => t.stop());
-    throw new Error('Could not capture system audio. Make sure audio is playing on this PC.');
+    throw new Error(
+      audioSource === 'system'
+        ? 'Could not capture system audio. Make sure audio is playing on this PC.'
+        : 'The microphone opened but produced no audio track. Check the input device in Windows sound settings.',
+    );
   }
 
   // Ask Chromium to resample to 16 kHz for us; the worklet downsamples itself
@@ -583,6 +617,28 @@ $('toneBtn').addEventListener('click', () => {
   const tone = $<HTMLSelectElement>('refineTone').value as OutputPreferences['tone'];
   refineAnswer(`Rewrite the previous AI suggestion in a ${tone} tone.`, { tone });
 });
+function selectedConversation(): ConversationTurn[] | undefined {
+  const entry = history.viewed();
+  if (!entry?.metrics || !entry.answer.trim() || state !== 'idle') return undefined;
+  const chain = [...(entry.context?.conversation ?? []), { question: entry.question, answer: entry.answer }];
+  const bounded = chain.length <= MAX_HISTORY ? chain : [chain[0]!, ...chain.slice(-(MAX_HISTORY - 1))];
+  return bounded.map((turn) => ({ question: turn.question.slice(0, 20_000), answer: turn.answer.slice(0, 20_000) }));
+}
+function requestDetailedFollowup(question: string): void {
+  const entry = history.viewed();
+  const conversation = selectedConversation();
+  if (!entry || !conversation) return;
+  const snapshot = cloneContext(entry.context ?? currentContext());
+  snapshot.conversation = conversation;
+  // A new follow-up keeps the source context, but not its one-question note.
+  snapshot.questionNote = '';
+  delete snapshot.relatedAnswer;
+  delete snapshot.refinement;
+  snapshot.output.answerStyle = 'detailed';
+  void submitAsk(question, snapshot);
+}
+$('deeperBtn').addEventListener('click', () => requestDetailedFollowup('Go deeper on the selected answer. Explain the reasoning and important trade-offs.'));
+$('exampleBtn').addEventListener('click', () => requestDetailedFollowup('Show a concrete worked example of the selected answer, explaining each step.'));
 $('editQuestionBtn').addEventListener('click', () => {
   const entry = history.viewed();
   if (!entry || askInput.disabled) return;
@@ -595,8 +651,10 @@ $('editQuestionBtn').addEventListener('click', () => {
 });
 $('followupBtn').addEventListener('click', () => {
   const entry = history.viewed();
-  if (!entry || askInput.disabled) return;
+  const conversation = selectedConversation();
+  if (!entry || !conversation || askInput.disabled) return;
   pendingFollowup = boundRelatedAnswer({ question: entry.question, answer: entry.answer });
+  pendingConversation = conversation;
   editingContext = undefined;
   $('editBanner').hidden = true;
   $('followupLabel').textContent = `Next question follows: ${entry.question.slice(0, 120)}. Prior answer is an AI suggestion, not something you said.`;
@@ -708,12 +766,17 @@ function renderEntry(): void {
 
   const m = e?.metrics;
   $('answerActions').hidden = !e?.question || (state !== 'idle' && state !== 'answering');
+  for (const id of ['deeperBtn', 'exampleBtn', 'followupBtn']) $<HTMLButtonElement>(id).disabled = !e?.metrics || !e.answer.trim() || state !== 'idle';
   $('entryContext').hidden = !e?.context;
   if (e?.context && renderedContext !== e.context) {
     const c = e.context;
-    $('entryContextText').textContent = `${c.profileName} · ${c.situation}\n${c.output.answerStyle} · ${c.output.format} · ${c.output.tone} · ${c.output.audience}\nBackground: ${c.background || '(none)'}\nInstructions: ${c.instructions || '(none)'}\nResume: ${c.resume || '(excluded or empty)'}\nJob description: ${c.jobDescription || '(excluded or empty)'}\nQuestion note: ${c.questionNote || '(none)'}${c.relatedAnswer ? '\nSelected prior question: ' + c.relatedAnswer.question + '\nPrior AI suggestion: ' + c.relatedAnswer.answer : ''}${c.refinement ? '\nRefinement: ' + c.refinement : ''}`;
+    $('entryContextText').textContent = `${c.profileName} · ${c.situation}\n${c.output.answerStyle} · ${c.output.format} · ${c.output.tone} · ${c.output.audience}\nPersonal profile: ${c.personalProfile || '(none)'}\nGlobal instructions: ${c.customInstructions || '(none)'}\nBackground: ${c.background || '(none)'}\nInstructions: ${c.instructions || '(none)'}\nResume: ${c.resume || '(excluded or empty)'}\nJob description: ${c.jobDescription || '(excluded or empty)'}\nQuestion note: ${c.questionNote || '(none)'}${c.relatedAnswer ? '\nSelected prior question: ' + c.relatedAnswer.question + '\nPrior AI suggestion: ' + c.relatedAnswer.answer : ''}${c.refinement ? '\nRefinement: ' + c.refinement : ''}${c.conversation?.length ? '\nExplicit conversation:\n' + c.conversation.map((turn) => 'Question: ' + turn.question + '\nPrior AI suggestion: ' + turn.answer).join('\n') : ''}`;
   }
   renderedContext = e?.context;
+  const usageLabel = m ? costLabel(m) : '';
+  $('costTag').hidden = !usageLabel;
+  $('costTag').textContent = usageLabel;
+  $('costTag').title = m ? costTitle(m) : '';
   if (m) {
     latencyTag.hidden = false;
     latencyTag.textContent = latencyLabel(m);
@@ -790,7 +853,7 @@ api.onLlmDone(buffered((e) => {
   }
   if (requestNoteRevision !== null && noteRevision === requestNoteRevision) noteInput.value = '';
   requestNoteRevision = null;
-  if (requestFollowup && pendingFollowup === requestFollowup) { pendingFollowup = undefined; $('followupBanner').hidden = true; }
+  if (requestFollowup && pendingFollowup === requestFollowup) { pendingFollowup = undefined; pendingConversation = undefined; $('followupBanner').hidden = true; }
   requestFollowup = undefined;
   setState('idle');
   statusText.textContent = 'Done — press Record for the next question';
@@ -845,13 +908,27 @@ function clearError(): void {
 }
 
 // ---------- Settings ----------
-const textFields = ['resume', 'jobDescription'] as const;
+const textFields = ['resume', 'jobDescription', 'personalProfile', 'customInstructions'] as const;
 const keyFields = ['deepgramKey', 'anthropicKey', 'groqKey'] as const;
 const PROVIDERS: readonly string[] = ['anthropic', 'groq'];
 const STYLES: readonly string[] = ['brief', 'balanced', 'detailed'];
 
 const asProvider = (v: string): LlmProviderId => (PROVIDERS.includes(v) ? (v as LlmProviderId) : 'anthropic');
 const asStyle = (v: string): AnswerStyle => (STYLES.includes(v) ? (v as AnswerStyle) : 'balanced');
+
+const SOURCES: readonly string[] = ['microphone', 'system'];
+const asSource = (v: string): AudioSource => (SOURCES.includes(v) ? (v as AudioSource) : 'microphone');
+const asAnthropicModel = (v: string): AnthropicModelId =>
+  (ANTHROPIC_MODELS as readonly string[]).includes(v) ? (v as AnthropicModelId) : DEFAULT_ANTHROPIC_MODEL;
+const asGroqModel = (v: string): GroqModelId =>
+  (GROQ_MODELS as readonly string[]).includes(v) ? (v as GroqModelId) : DEFAULT_GROQ_MODEL;
+
+// Only the active provider's model picker is live; the other is grayed out so
+// changing it (and wondering why nothing happened) is impossible.
+function syncModelPickers(provider: string): void {
+  $<HTMLSelectElement>('anthropicModel').disabled = provider !== 'anthropic';
+  $<HTMLSelectElement>('groqModel').disabled = provider !== 'groq';
+}
 
 // ---------- Answer-style quick toggle ----------
 // Length changes preserve the stable prompt prefix. Actual latency still
@@ -904,8 +981,13 @@ function applyHotkeyUi(s: SettingsView): void {
 }
 
 function fillSettingsForm(s: SettingsView): void {
-  for (const f of textFields) $<HTMLTextAreaElement>(f).value = s[f];
+  for (const f of textFields) $<HTMLTextAreaElement>(f).value = s[f] ?? '';
   $<HTMLSelectElement>('llmProvider').value = s.llmProvider;
+  syncModelPickers(s.llmProvider);
+  $<HTMLSelectElement>('anthropicModel').value = s.anthropicModel ?? DEFAULT_ANTHROPIC_MODEL;
+  $<HTMLSelectElement>('groqModel').value = s.groqModel ?? DEFAULT_GROQ_MODEL;
+  $<HTMLSelectElement>('audioSource').value = s.audioSource ?? 'microphone';
+  audioSource = s.audioSource ?? 'microphone';
   $<HTMLSelectElement>('answerStyle').value = s.answerStyle;
   $<HTMLInputElement>('alwaysOnTop').checked = s.alwaysOnTop;
   const hotkeyInput = $<HTMLInputElement>('hotkey');
@@ -944,6 +1026,8 @@ settingsBtn.addEventListener('click', async () => {
   }
 });
 
+$<HTMLSelectElement>('llmProvider').addEventListener('change', () => syncModelPickers($<HTMLSelectElement>('llmProvider').value));
+
 $('backBtn').addEventListener('click', () => closeSettings());
 
 document.addEventListener('keydown', (e) => {
@@ -956,6 +1040,11 @@ document.addEventListener('keydown', (e) => {
 let savedTimer: ReturnType<typeof setTimeout> | null = null;
 $('saveBtn').addEventListener('click', async () => {
   const patch: SettingsPatch = {
+    personalProfile: $<HTMLTextAreaElement>('personalProfile').value,
+    customInstructions: $<HTMLTextAreaElement>('customInstructions').value,
+    anthropicModel: asAnthropicModel($<HTMLSelectElement>('anthropicModel').value),
+    groqModel: asGroqModel($<HTMLSelectElement>('groqModel').value),
+    audioSource: asSource($<HTMLSelectElement>('audioSource').value),
     resume: $<HTMLTextAreaElement>('resume').value,
     jobDescription: $<HTMLTextAreaElement>('jobDescription').value,
     llmProvider: asProvider($<HTMLSelectElement>('llmProvider').value),
@@ -1003,8 +1092,10 @@ void (async () => {
     setState(state);
     applyHotkeyUi(s);
     const missingLlmKey = s.llmProvider === 'groq' ? !s.hasGroqKey : !s.hasAnthropicKey;
-    if ((!s.hasDeepgramKey || missingLlmKey) && state === 'idle') {
-      statusText.textContent = 'First run: open Settings (gear icon) and add your API keys';
+    if (missingLlmKey && state === 'idle') {
+      statusText.textContent = 'First run: open Settings (gear icon) and add your answer provider API key';
+    } else if (!s.hasDeepgramKey && state === 'idle') {
+      statusText.textContent = 'Ready — type a question. Add a Deepgram key in Settings to record audio.';
     }
   } catch (err) {
     showError(err);

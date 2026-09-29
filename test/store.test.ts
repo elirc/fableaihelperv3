@@ -119,7 +119,7 @@ describe('store validation of settings.json', () => {
     expect(v.jobDescription).toBe('');
     expect(v.alwaysOnTop).toBe(true);
     expect(v.llmProvider).toBe('anthropic');
-    expect(v.answerStyle).toBe('balanced');
+    expect(v.answerStyle).toBe('brief');
     expect(v.hotkey).toBe(DEFAULT_HOTKEY);
     expect(v.hasDeepgramKey).toBe(false);
 
@@ -128,7 +128,7 @@ describe('store validation of settings.json', () => {
     const profile = store.getProfile();
     expect(profile.resume).toBe('');
     expect(profile.llmProvider).toBe('anthropic');
-    expect(profile.answerStyle).toBe('balanced');
+    expect(profile.answerStyle).toBe('brief');
   });
 
   test('one bad field does not cost the user the rest of the file', async () => {
@@ -168,7 +168,7 @@ describe('store validation of settings.json', () => {
     expect(store.getSettingsView()).toMatchObject({
       resume: '',
       llmProvider: 'anthropic',
-      answerStyle: 'balanced',
+      answerStyle: 'brief',
       hotkey: DEFAULT_HOTKEY,
       hasDeepgramKey: false,
     });
@@ -287,7 +287,10 @@ describe('store secrets', () => {
     store.applySettingsPatch({ resume: 'r', anthropicKey: 'sk-ant-secret' });
 
     const profile = store.getProfile();
-    expect(Object.keys(profile).sort()).toEqual(['answerStyle', 'jobDescription', 'llmProvider', 'resume']);
+    expect(Object.keys(profile).sort()).toEqual([
+      'answerStyle', 'anthropicModel', 'customInstructions', 'groqModel',
+      'jobDescription', 'llmProvider', 'personalProfile', 'resume',
+    ]);
     expect(JSON.stringify(profile)).not.toContain('sk-ant-secret');
   });
 });
@@ -334,10 +337,39 @@ describe('store patch semantics', () => {
 });
 
 describe('store answerStyle and hotkey', () => {
-  test('default to balanced and the shared DEFAULT_HOTKEY', async () => {
+  test('upgrading keeps an explicitly saved answer style', async () => {
+    writeSettings({ answerStyle: 'balanced', resume: 'keep my resume', secrets: { groqKey: encBlob('gsk-existing') } });
+    const store = await freshStore();
+    expect(store.getSettingsView()).toMatchObject({ answerStyle: 'balanced', personalProfile: '', customInstructions: '' });
+    store.applySettingsPatch({ personalProfile: 'Python developer', customInstructions: 'Use practical examples.' });
+    store.resetCacheForTests();
+    expect(store.getProfile()).toMatchObject({
+      answerStyle: 'balanced', resume: 'keep my resume', personalProfile: 'Python developer', customInstructions: 'Use practical examples.',
+    });
+    expect(store.getSecret('groqKey')).toBe('gsk-existing');
+  });
+
+  test('profile and custom instructions can be edited and cleared independently', async () => {
+    const store = await freshStore();
+    store.applySettingsPatch({ personalProfile: 'Backend engineer', customInstructions: 'Prefer Go.' });
+    store.applySettingsPatch({ personalProfile: '' });
+    store.resetCacheForTests();
+    expect(store.getProfile()).toMatchObject({ personalProfile: '', customInstructions: 'Prefer Go.' });
+    store.applySettingsPatch({ customInstructions: '' });
+    store.resetCacheForTests();
+    expect(store.getSettingsView().customInstructions).toBe('');
+  });
+
+  test('invalid saved personalization fields do not discard other settings', async () => {
+    writeSettings({ personalProfile: [], customInstructions: 'x'.repeat(8001), resume: 'keep', answerStyle: 'detailed' });
+    const store = await freshStore();
+    expect(store.getProfile()).toMatchObject({ personalProfile: '', customInstructions: '', resume: 'keep', answerStyle: 'detailed' });
+  });
+
+  test('default to brief and the shared DEFAULT_HOTKEY', async () => {
     const store = await freshStore();
     const v = store.getSettingsView();
-    expect(v.answerStyle).toBe('balanced');
+    expect(v.answerStyle).toBe('brief');
     expect(v.hotkey).toBe(DEFAULT_HOTKEY);
     expect(store.getHotkey()).toBe(DEFAULT_HOTKEY);
   });
@@ -704,5 +736,81 @@ describe('store usable credentials and encryption reporting', () => {
     mocked.encryptionAvailable = true;
     expect(store.applySettingsPatch({ anthropicKey: 'ant' }).keyStorage).toBe('mixed');
     expect(store.applySettingsPatch({ deepgramKey: 'dg-new' }).keyStorage).toBe('encrypted');
+  });
+});
+
+describe('practice-mode settings (audio source and model picks)', () => {
+  test('new-install brevity agrees across legacy style, output defaults, and the Interview profile', async () => {
+    const view = (await freshStore()).getSettingsView();
+    expect(view.answerStyle).toBe('brief');
+    expect(view.outputDefaults?.answerStyle).toBe('brief');
+    expect(view.contextProfiles?.[0]?.output.answerStyle).toBe('brief');
+  });
+
+  test('migrating personalized settings preserves explicit style and global text beside scenario drafts', async () => {
+    writeSettings({
+      answerStyle: 'detailed', personalProfile: '  My experience\nsecond line  ',
+      customInstructions: 'Keep these global directions', audioSource: 'system',
+      anthropicModel: 'claude-sonnet-5', groqModel: 'llama-3.1-8b-instant',
+    });
+    const store = await freshStore();
+    const migrated = store.getSettingsView();
+    expect(migrated.outputDefaults?.answerStyle).toBe('detailed');
+    expect(migrated.contextProfiles?.[0]?.output.answerStyle).toBe('detailed');
+    store.applySettingsPatch({ contextProfiles: [createProfile('meeting', 'meeting')], activeProfileId: 'meeting' });
+    store.resetCacheForTests();
+    expect(store.getSettingsView()).toMatchObject({
+      answerStyle: 'detailed', personalProfile: '  My experience\nsecond line  ',
+      customInstructions: 'Keep these global directions', audioSource: 'system',
+      anthropicModel: 'claude-sonnet-5', groqModel: 'llama-3.1-8b-instant', activeProfileId: 'meeting',
+    });
+  });
+
+  test('defaults: microphone source and the latency-first models', async () => {
+    const store = await freshStore();
+    const v = store.getSettingsView();
+    expect(v.audioSource).toBe('microphone');
+    expect(v.anthropicModel).toBe('claude-haiku-4-5');
+    expect(v.groqModel).toBe('openai/gpt-oss-120b');
+  });
+
+  test('a settings.json written before these fields existed falls back to the defaults', async () => {
+    // The practice rework must not brick a v2.0 settings file.
+    writeSettings({ resume: 'keep me', llmProvider: 'groq' });
+    const store = await freshStore();
+    const v = store.getSettingsView();
+    expect(v.resume).toBe('keep me');
+    expect(v.audioSource).toBe('microphone');
+    expect(v.anthropicModel).toBe('claude-haiku-4-5');
+    expect(v.groqModel).toBe('openai/gpt-oss-120b');
+  });
+
+  test('patched values persist and reach getProfile', async () => {
+    let store = await freshStore();
+    store.applySettingsPatch({
+      audioSource: 'system',
+      anthropicModel: 'claude-sonnet-5',
+      groqModel: 'llama-3.1-8b-instant',
+    });
+    store = await freshStore(); // re-read from disk, no cache
+    expect(store.getSettingsView().audioSource).toBe('system');
+    const profile = store.getProfile();
+    expect(profile.anthropicModel).toBe('claude-sonnet-5');
+    expect(profile.groqModel).toBe('llama-3.1-8b-instant');
+  });
+
+  test('a model no longer in the curated list falls back instead of failing the file', async () => {
+    writeSettings({
+      resume: 'keep me',
+      audioSource: 'telepathy',
+      anthropicModel: 'claude-2.1',
+      groqModel: 'mixtral-8x7b-32768',
+    });
+    const store = await freshStore();
+    const v = store.getSettingsView();
+    expect(v.resume).toBe('keep me'); // per-field fallback, not whole-file reset
+    expect(v.audioSource).toBe('microphone');
+    expect(v.anthropicModel).toBe('claude-haiku-4-5');
+    expect(v.groqModel).toBe('openai/gpt-oss-120b');
   });
 });

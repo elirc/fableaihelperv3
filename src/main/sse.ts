@@ -5,12 +5,33 @@
 // Feed each decoded chunk to parseSSEChunk together with whatever was left
 // over from the last call; it returns the content deltas found in the
 // *complete* lines and the trailing partial line to carry forward.
-export function parseSSEChunk(buffer: string): { deltas: string[]; rest: string } {
+
+/** Token accounting as OpenAI-compatible streams report it (final chunk, or Groq's x_groq envelope). */
+export interface SseUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+}
+
+export interface SseError {
+  message?: string;
+  code?: string | number;
+  type?: string;
+}
+
+export interface SseParseResult {
+  deltas: string[];
+  rest: string;
+  /** Present only when a parsed line carried a usage object; the last one seen wins. */
+  usage?: SseUsage;
+  /** Errors can arrive after HTTP 200, inside the event stream. */
+  error?: SseError;
+  done?: true;
+}
+
+export function parseSSEChunk(buffer: string): SseParseResult {
   const deltas: string[] = [];
-  // Scan by index instead of re-assigning `buffer = buffer.slice(...)` per
-  // line: this runs for every network chunk of a streaming answer, and slicing
-  // the whole remaining buffer once per line is O(lines x buffer) copying when
-  // a chunk carries several events.
+  let usage: SseUsage | undefined;
+  // Scan by index so a chunk with many events is copied only once.
   let start = 0;
   let nl: number;
   while ((nl = buffer.indexOf('\n', start)) !== -1) {
@@ -18,15 +39,30 @@ export function parseSSEChunk(buffer: string): { deltas: string[]; rest: string 
     start = nl + 1;
     if (!line.startsWith('data:')) continue; // skip comments/keep-alives/blank lines
     const payload = line.slice(5).trim();
-    if (payload === '[DONE]') continue;
+    if (payload === '[DONE]') {
+      return { deltas, rest: '', ...(usage ? { usage } : {}), done: true };
+    }
     try {
-      const delta = JSON.parse(payload).choices?.[0]?.delta?.content;
-      if (delta) deltas.push(delta);
+      const obj = JSON.parse(payload);
+      if (obj?.error) {
+        const error: SseError = typeof obj.error === 'string'
+          ? { message: obj.error }
+          : typeof obj.error === 'object' ? obj.error : {};
+        return { deltas, rest: '', ...(usage ? { usage } : {}), error };
+      }
+      const delta = obj?.choices?.[0]?.delta?.content;
+      if (typeof delta === 'string' && delta) deltas.push(delta);
+      // Usage arrives on the final chunk when the request asked for it
+      // (stream_options.include_usage); Groq also mirrors it under x_groq.
+      const u = obj?.usage ?? obj?.x_groq?.usage;
+      if (u && typeof u === 'object') usage = u as SseUsage;
     } catch {
       // malformed/partial JSON — ignore this line rather than crash the stream
     }
   }
-  return { deltas, rest: start === 0 ? buffer : buffer.slice(start) };
+  // Conditional so callers comparing the whole result don't see a usage key
+  // on streams that never reported one.
+  return usage ? { deltas, rest: start === 0 ? buffer : buffer.slice(start), usage } : { deltas, rest: start === 0 ? buffer : buffer.slice(start) };
 }
 
 // End-of-stream flush for whatever parseSSEChunk handed back as `rest`.
@@ -37,11 +73,13 @@ export function parseSSEChunk(buffer: string): { deltas: string[]; rest: string 
 // final `data: {...}` without a trailing newline (a truncated or abruptly
 // closed response), that last line sits in `rest` forever and its delta is
 // silently lost — the user sees an answer missing its last few words with no
-// error. Call this once after the read loop ends.
+// error. Call this once after the read loop ends. The usage object rides the
+// same final line on some servers, so it is surfaced here too.
 //
 // Genuinely incomplete JSON still parses to nothing and is discarded, which is
 // the right outcome: there is no more data coming to complete it.
-export function parseSSETail(rest: string): string[] {
-  if (!rest.trim()) return [];
-  return parseSSEChunk(rest.endsWith('\n') ? rest : rest + '\n').deltas;
+export function parseSSETail(rest: string): Omit<SseParseResult, 'rest'> {
+  if (!rest.trim()) return { deltas: [] };
+  const { rest: _rest, ...result } = parseSSEChunk(rest.endsWith('\n') ? rest : rest + '\n');
+  return result;
 }

@@ -115,3 +115,41 @@ describe('current question and explicit related answer', () => {
     expect(buildSystemPromptBlocks(snapshot).cachedPrefix).not.toContain('Make this less formal');
   });
 });
+
+describe('practice coaching with scenario snapshots', () => {
+  test('only interview scenarios include mock practice and Key beats coaching', () => {
+    expect(buildSystemPrompt(context('interview'))).toContain('mock interview practice session');
+    expect(buildSystemPrompt(context('interview'))).toContain('"**Key beats**"');
+    for (const situation of ['technical', 'client', 'meeting', 'custom'] as const) {
+      expect(buildSystemPromptBlocks(context(situation)).cachedPrefix).not.toContain('mock interview');
+      expect(buildSystemPromptBlocks(context(situation)).cachedPrefix).not.toContain('"**Key beats**"');
+    }
+  });
+
+  test('personal profile stays reference data while custom instructions override coaching defaults', () => {
+    const snapshot = { ...context(), personalProfile: 'I build Python APIs.', customInstructions: 'Use code examples and omit Key beats.' };
+    const blocks = buildSystemPromptBlocks(snapshot);
+    expect(blocks.cachedPrefix).toContain('"personalProfile":"I build Python APIs."');
+    expect(blocks.cachedPrefix).toContain('SAVED CUSTOM INSTRUCTIONS\nUse code examples and omit Key beats.');
+    expect(blocks.cachedPrefix).toContain('override default tone, role, length, and format, including Key beats');
+    expect(blocks.styleSuffix).toContain('apply to the main answer body');
+    expect(buildSystemPromptBlocks({ ...snapshot, output: { ...snapshot.output, answerStyle: 'detailed' } }).cachedPrefix).toBe(blocks.cachedPrefix);
+  });
+
+  test('multi-turn context preserves order and explicit requests without asserting generated claims', () => {
+    const conversation = [{ question: 'First question', answer: 'First suggestion' }, { question: 'Second question', answer: 'Second suggestion' }];
+    const message = buildUserMessage('Show a worked example', { ...context(), conversation });
+    expect(message).toContain(JSON.stringify(conversation));
+    expect(message).toContain('Show a worked example');
+    expect(message).toContain('unconfirmed generated suggestions');
+    expect(message).toContain('not evidence of user experience');
+    expect(buildSystemPromptBlocks({ ...context(), conversation }).cachedPrefix).not.toContain('First suggestion');
+  });
+
+  test('a selected related answer already present in explicit conversation is included once', () => {
+    const relatedAnswer = { question: 'Question', answer: 'One unique suggestion' };
+    const message = buildUserMessage('Expand this', { ...context(), relatedAnswer, conversation: [relatedAnswer] });
+    expect(message.split('One unique suggestion')).toHaveLength(2);
+    expect(message).not.toContain('EXPLICITLY RELATED PRIOR QUESTION');
+  });
+});

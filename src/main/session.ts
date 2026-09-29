@@ -1,6 +1,6 @@
 import { performance } from 'node:perf_hooks';
-import type { AnswerMetrics, AppError, ContextSnapshot, LlmProviderId } from '../shared/types';
-import { CONTEXT_LIMITS, contextCharacters } from '../shared/context';
+import type { AnswerMetrics, AnswerUsage, AnswerOptions, AppError, ContextSnapshot, LlmProviderId, SettingsView } from '../shared/types';
+import { CONTEXT_LIMITS, contextCharacters, resolveContext } from '../shared/context';
 import { contextSnapshotSchema } from './context-schema';
 
 // One live question/answer pipeline. The manager owns exactly one active
@@ -24,7 +24,7 @@ export interface SttStream {
 }
 
 export interface LlmProvider {
-  generate(transcript: string, onDelta: (delta: string) => void, signal: AbortSignal): Promise<string>;
+  generate(transcript: string, onDelta: (delta: string) => void, signal: AbortSignal, onUsage?: (usage: AnswerUsage) => void, options?: AnswerOptions): Promise<string>;
 }
 
 export interface SessionEvents {
@@ -36,7 +36,7 @@ export interface SessionEvents {
 
 export interface SessionDeps {
   createStt(): Promise<SttStream>;
-  createLlm(context?: ContextSnapshot, provider?: LlmProviderId): LlmProvider;
+  createLlm(context?: ContextSnapshot, provider?: LlmProviderId, model?: string): LlmProvider;
   events: SessionEvents;
   timeouts?: Partial<Timeouts>;
 }
@@ -67,6 +67,7 @@ interface ActiveSession {
   id: number;
   context?: ContextSnapshot;
   provider?: LlmProviderId;
+  model?: string;
   /** Null for ask() sessions: the question arrived as text, nothing to record. */
   stt: SttStream | null;
   abort: AbortController;
@@ -89,7 +90,7 @@ export class SessionManager {
   }
 
   /** Start a new session, aborting any previous one. Resolves once STT is connected. */
-  async start(context?: ContextSnapshot, provider?: LlmProviderId): Promise<number> {
+  async start(context?: ContextSnapshot, provider?: LlmProviderId, model?: string): Promise<number> {
     const snapshot = this.snapshot(context);
     this.cancelActive();
     const id = this.nextId++;
@@ -106,7 +107,7 @@ export class SessionManager {
     // Install before wiring: a stream that died while we were connecting
     // delivers its queued error synchronously from onError(), and that error
     // must find a live session to tear down instead of being dropped.
-    this.active = { id, stt, abort, stopped: false, transcriptFinal: false, context: snapshot, provider };
+    this.active = { id, stt, abort, stopped: false, transcriptFinal: false, context: snapshot, provider, model };
     stt.onPartial((text, isFinal) => {
       if (this.active?.id === id) this.deps.events.onSttPartial(id, text, isFinal);
     });
@@ -139,7 +140,7 @@ export class SessionManager {
    * onLlmDelta per token, and onLlmDone (or onError). Metrics are measured from
    * this call, with sttFinalizeMs pinned to 0 since nothing was finalized.
    */
-  async ask(text: string, context?: ContextSnapshot, provider?: LlmProviderId): Promise<number> {
+  async ask(text: string, context?: ContextSnapshot | AnswerOptions, provider?: LlmProviderId, model?: string): Promise<number> {
     // The latency clock starts the moment the user submits the question.
     const t0 = performance.now();
     const trimmed = typeof text === 'string' ? text.trim() : '';
@@ -160,6 +161,7 @@ export class SessionManager {
       id,
       context: snapshot,
       provider,
+      model,
       stt: null, // the question arrived as text — nothing to record or finalize
       abort: new AbortController(),
       stopped: true, // there is no recording to stop; audio() must be a no-op
@@ -211,7 +213,7 @@ export class SessionManager {
       if (!transcript) {
         throw {
           code: 'no_speech',
-          message: 'No speech detected in the recording. Make sure call audio is playing.',
+          message: 'No speech detected in the recording. Check the audio source in Settings: microphone for a partner in the room, system audio for sound this PC is playing.',
         } satisfies AppError;
       }
       await this.streamAnswer(s, transcript, t0, sttFinalizeMs);
@@ -232,13 +234,14 @@ export class SessionManager {
     this.validateRequestSize(transcript, s.context);
     const since = () => Math.round(performance.now() - t0);
     let firstTokenMs: number | null = null;
+    let usage: AnswerUsage | undefined;
     // The renderer keys everything off the recorded-session event shape, so
     // the transcript always goes out as one already-final partial.
     this.deps.events.onSttPartial(s.id, transcript, true);
-    const llm = this.deps.createLlm(s.context, s.provider);
+    const llm = this.deps.createLlm(s.context, s.provider, s.model);
     const answer = await this.runLlm(s, transcript, llm, () => {
       firstTokenMs = since();
-    });
+    }, (reported) => { usage = reported; });
     if (this.isStale(s.id)) return;
     const totalMs = since();
     this.deps.events.onLlmDone(s.id, transcript, answer, {
@@ -247,15 +250,20 @@ export class SessionManager {
       // delta had no "first token" moment; reporting 0 would read as instant.
       firstTokenMs: firstTokenMs ?? totalMs,
       totalMs,
+      ...(usage ? { usage } : {}),
     }, s.context);
   }
 
-  private snapshot(context?: ContextSnapshot): ContextSnapshot | undefined {
+  private snapshot(context?: ContextSnapshot | AnswerOptions): ContextSnapshot | undefined {
     if (!context) return undefined;
     // Parsing copies nested objects and validates before the live session is
     // superseded. Freeze to prevent accidental mutation by a provider or caller.
-    const snapshot = contextSnapshotSchema.parse(context);
+    const snapshot = contextSnapshotSchema.parse('output' in context ? context : resolveContext({ resume: '', jobDescription: '', answerStyle: 'brief' } as SettingsView, context));
     Object.freeze(snapshot.output);
+    if (snapshot.conversation) {
+      snapshot.conversation.forEach((turn) => Object.freeze(turn));
+      Object.freeze(snapshot.conversation);
+    }
     if (snapshot.relatedAnswer) Object.freeze(snapshot.relatedAnswer);
     return Object.freeze(snapshot);
   }
@@ -331,6 +339,7 @@ export class SessionManager {
     transcript: string,
     llm: LlmProvider,
     onFirstToken: () => void,
+    onUsage: (usage: AnswerUsage) => void,
   ): Promise<string> {
     const { signal } = s.abort;
     let gotFirstToken = false;
@@ -377,6 +386,7 @@ export class SessionManager {
             if (!settled && this.active?.id === s.id) this.deps.events.onLlmDelta(s.id, delta);
           },
           signal,
+          (usage) => { if (!settled && this.active?.id === s.id) onUsage({ ...usage }); },
         ))
         .then((full) => {
           if (settled) return;

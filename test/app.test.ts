@@ -42,9 +42,9 @@ const el = <T extends HTMLElement = HTMLElement>(id: string): T => {
 };
 const statusLine = (): string => el('statusText').textContent ?? '';
 
-const BASE_READY = 'Ready — press Record while the other person is speaking';
+const BASE_READY = 'Ready — press Record while your practice partner asks a question';
 const HOTKEY_READY = 'Ready — press Record or Ctrl+Shift+Space';
-const ANSWER_PLACEHOLDER = 'Your AI-suggested answer will stream here.';
+const ANSWER_PLACEHOLDER = 'The model answer to practise against will stream here.';
 const TRANSCRIPT_PLACEHOLDER = 'The live transcript will appear here while you record.';
 
 // ---------- async helpers ----------
@@ -160,6 +160,10 @@ function stubCapture(opts: { defer?: boolean } = {}): CaptureStub {
   Object.defineProperty(navigator, 'mediaDevices', {
     configurable: true,
     value: {
+      getUserMedia: vi.fn(async () => {
+        if (opts.defer) await gate.promise;
+        return stream as unknown as MediaStream;
+      }),
       getDisplayMedia: vi.fn(async () => {
         if (opts.defer) await gate.promise;
         return stream as unknown as MediaStream;
@@ -250,6 +254,7 @@ beforeEach(() => {
   Object.defineProperty(navigator, 'mediaDevices', {
     configurable: true,
     value: {
+      getUserMedia: vi.fn(async (): Promise<MediaStream> => { throw new Error('Capture denied by test'); }),
       getDisplayMedia: vi.fn(async (): Promise<MediaStream> => {
         throw new Error('Capture denied by test');
       }),
@@ -275,12 +280,12 @@ describe('boot', () => {
 
   test('first run without a Deepgram key nudges toward Settings', async () => {
     await boot({ hasDeepgramKey: false });
-    expect(statusLine()).toContain('open Settings');
+    expect(statusLine()).toContain('Settings');
   });
 
   test('a missing key for the selected LLM provider also nudges', async () => {
     await boot({ llmProvider: 'groq', hasGroqKey: false, hasAnthropicKey: true });
-    expect(statusLine()).toContain('open Settings');
+    expect(statusLine()).toContain('Settings');
   });
 
   test('no nudge when the selected provider has its key, even if the other is missing', async () => {
@@ -580,7 +585,7 @@ describe('recording lifecycle', () => {
     await flush();
 
     expect(el('errorBox').hidden).toBe(false);
-    expect(el('errorBox').textContent).toBe('Capture denied by test');
+    expect(el('errorBox').textContent).toContain('Could not open the microphone');
     expect(statusLine()).toBe(HOTKEY_READY);
     expect(api.cancelSession).toHaveBeenCalledWith(3); // the orphaned session died
     // The empty live entry was discarded, not kept as a blank history row.
@@ -1297,4 +1302,146 @@ describe('context lifecycle races', () => {
   expect(actions.querySelector('summary')?.textContent).toBe('Refine or follow up');
   actions.open = true;
   expect(actions.querySelector('#shorterBtn')).not.toBeNull();
+});
+
+describe('merged practice features', () => {
+  test('recording defaults to microphone and saved system source uses loopback instead', async () => {
+    const { fire } = await boot();
+    stubCapture();
+    el('recordBtn').click();
+    await flush();
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledWith({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    expect(navigator.mediaDevices.getDisplayMedia).not.toHaveBeenCalled();
+    el('recordBtn').click();
+    await flush();
+    fire.llmDone({ sessionId: 1, transcript: 'Q', answer: 'A', metrics: metrics() });
+    const system = await boot({ audioSource: 'system' });
+    stubCapture();
+    el('recordBtn').click();
+    await flush();
+    expect(navigator.mediaDevices.getDisplayMedia).toHaveBeenCalled();
+    expect(navigator.mediaDevices.getUserMedia).not.toHaveBeenCalled();
+    el('recordBtn').click();
+    await flush();
+    system.fire.llmDone({ sessionId: 1, transcript: 'Q', answer: 'A', metrics: metrics() });
+  });
+
+  test('personalization and model settings load, save, snapshot and retain drafts on failure', async () => {
+    const initial = makeSettings({ personalProfile: 'Python engineer', customInstructions: 'Use concrete examples', anthropicModel: 'claude-haiku-4-5', groqModel: 'openai/gpt-oss-120b', audioSource: 'microphone' });
+    const { api } = await boot(initial, (api) => api.saveSettings.mockImplementation(async (patch) => Object.assign(initial, patch)));
+    el('settingsBtn').click();
+    await flush();
+    expect(el<HTMLTextAreaElement>('personalProfile').value).toBe('Python engineer');
+    expect(el<HTMLSelectElement>('anthropicModel').disabled).toBe(false);
+    expect(el<HTMLSelectElement>('groqModel').disabled).toBe(true);
+    el<HTMLSelectElement>('llmProvider').value = 'groq';
+    el('llmProvider').dispatchEvent(new Event('change'));
+    expect(el<HTMLSelectElement>('groqModel').disabled).toBe(false);
+    expect(el<HTMLSelectElement>('anthropicModel').disabled).toBe(true);
+    inputValue('groqModel', 'openai/gpt-oss-20b');
+    inputValue('personalProfile', 'Engineering manager');
+    inputValue('customInstructions', 'Explain the business impact');
+    inputValue('audioSource', 'system');
+    el('saveBtn').click();
+    await flush();
+    expect(api.saveSettings).toHaveBeenCalledWith(expect.objectContaining({ personalProfile: 'Engineering manager', customInstructions: 'Explain the business impact', groqModel: 'openai/gpt-oss-20b', audioSource: 'system' }));
+    el('backBtn').click();
+    submitAsk('Q');
+    await flush();
+    expect(lastSnapshot(api)).toMatchObject({ personalProfile: 'Engineering manager', customInstructions: 'Explain the business impact' });
+    el('settingsBtn').click();
+    await flush();
+    inputValue('customInstructions', 'Keep this failed draft');
+    api.saveSettings.mockRejectedValueOnce(new Error('disk full'));
+    el('saveBtn').click();
+    await flush();
+    expect(el<HTMLTextAreaElement>('customInstructions').value).toBe('Keep this failed draft');
+    expect(el('settingsError').textContent).toBe('disk full');
+  });
+
+  test('Go deeper and examples preserve selected context with temporary detailed length', async () => {
+    const { api, fire } = await boot({ answerStyle: 'brief' });
+    inputValue('contextBackground', 'Saved topic');
+    await completeAsk(fire, 'What is caching?', 'Reuse results.');
+    inputValue('contextBackground', 'Different next topic');
+    el('deeperBtn').click();
+    await flush();
+    expect(api.askQuestion.mock.calls.at(-1)?.[0]).toContain('Go deeper');
+    expect(lastSnapshot(api)).toMatchObject({ background: 'Saved topic', output: { answerStyle: 'detailed' }, conversation: [{ question: 'What is caching?', answer: 'Reuse results.' }] });
+    expect(api.saveSettings).not.toHaveBeenCalled();
+    expect(el('styleBrief').getAttribute('aria-pressed')).toBe('true');
+    expect(el<HTMLButtonElement>('exampleBtn').disabled).toBe(true);
+    fire.llmDone({ sessionId: 1, transcript: 'Go deeper on caching', answer: 'Consider invalidation.', metrics: metrics() });
+    el('exampleBtn').click();
+    await flush();
+    expect(api.askQuestion.mock.calls.at(-1)?.[0]).toContain('worked example');
+    expect(lastSnapshot(api)?.conversation?.length).toBe(2);
+  });
+
+  test('explicit followup chains retain anchor and recent turns and branch from the selected entry', async () => {
+    const { api, fire } = await boot();
+    await completeAsk(fire, 'Question 0', 'Answer 0');
+    for (let i = 1; i <= 8; i++) {
+      el('followupBtn').click();
+      await completeAsk(fire, `Question ${i}`, `Answer ${i}`);
+    }
+    expect(lastSnapshot(api)?.conversation).toEqual([
+      { question: 'Question 0', answer: 'Answer 0' },
+      ...Array.from({ length: 5 }, (_, i) => ({ question: `Question ${i + 3}`, answer: `Answer ${i + 3}` })),
+    ]);
+    el('prevBtn').click();
+    el('prevBtn').click();
+    el('followupBtn').click();
+    submitAsk('Branch off question 6');
+    await flush();
+    expect(lastSnapshot(api)?.conversation?.at(-1)).toEqual({ question: 'Question 6', answer: 'Answer 6' });
+    expect(lastSnapshot(api)?.conversation?.some((turn) => turn.question === 'Question 7')).toBe(false);
+    fire.llmDone({ sessionId: 1, transcript: 'Branch off question 6', answer: 'Branch answer', metrics: metrics() });
+    submitAsk('Independent');
+    await flush();
+    expect(lastSnapshot(api)?.conversation).toBeUndefined();
+  });
+
+  test('failed partial answers cannot be selected as completed followup context', async () => {
+    const { fire } = await boot();
+    submitAsk('Q');
+    await flush();
+    fire.llmDelta({ sessionId: 1, delta: 'Partial' });
+    fire.sessionError({ sessionId: 1, error: { code: 'llm_timeout', message: 'timeout' } });
+    expect(el<HTMLButtonElement>('deeperBtn').disabled).toBe(true);
+    expect(el<HTMLButtonElement>('exampleBtn').disabled).toBe(true);
+    expect(el<HTMLButtonElement>('followupBtn').disabled).toBe(true);
+  });
+
+  test('usage chip displays estimated cost or tokens honestly and follows history selection', async () => {
+    const { fire } = await boot();
+    submitAsk('Q1');
+    await flush();
+    fire.llmDone({ sessionId: 1, transcript: 'Q1', answer: 'A1', metrics: metrics({ usage: { model: 'claude-haiku-4-5', inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0.0023 } }) });
+    expect(el('costTag').textContent).toBe('$0.0023');
+    expect(el('costTag').title).toContain('claude-haiku-4-5');
+    submitAsk('Q2');
+    await flush();
+    fire.llmDone({ sessionId: 1, transcript: 'Q2', answer: 'A2', metrics: metrics({ usage: { model: 'openai/gpt-oss-120b', inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0 } }) });
+    expect(el('costTag').textContent).toBe('100→50 tok');
+    expect(el('costTag').title).toContain('pricing not pinned');
+    el('prevBtn').click();
+    expect(el('costTag').textContent).toBe('$0.0023');
+  });
+});
+
+test.each(['deeperBtn', 'exampleBtn'])('%s does not replay the source one-question note or consume the next pending note', async (action) => {
+  const { api, fire } = await boot();
+  inputValue('questionNote', 'Only for the original answer');
+  await completeAsk(fire, 'Original question', 'Original answer');
+  inputValue('questionNote', 'For my next typed question');
+  el(action).click();
+  await flush();
+  expect(lastSnapshot(api)?.questionNote).toBe('');
+  expect(lastSnapshot(api)?.conversation).toEqual([{ question: 'Original question', answer: 'Original answer' }]);
+  fire.llmDone({ sessionId: 1, transcript: 'Detailed followup', answer: 'Detailed answer', metrics: metrics() });
+  expect(el<HTMLTextAreaElement>('questionNote').value).toBe('For my next typed question');
+  submitAsk('My next typed question');
+  await flush();
+  expect(lastSnapshot(api)?.questionNote).toBe('For my next typed question');
 });

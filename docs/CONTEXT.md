@@ -11,6 +11,9 @@ profile, describe the situation, add background facts, and write instructions
 for how the assistant should respond. Interview, technical discussion, client,
 meeting, and custom situations provide starting points. Instructions are editable.
 
+Settings also provides a global Personal profile (facts about you) and System
+prompt customization. Both are captured in each request snapshot.
+
 Profiles independently choose whether to include the saved resume and job
 description. Put project details, a different role description, product facts,
 or an agenda in Background. Output controls separate length from format
@@ -34,8 +37,11 @@ available for correction or retry.
 - Current-context regeneration deliberately uses the current controls.
 - Shorter, More specific, and Change tone revise the selected suggestion.
 - Edit question & answer again allows correction of a misheard question.
-- Follow up on this entry explicitly attaches an excerpt of that entry to the
-  next question. It does not include unrelated history.
+- Go deeper and Worked example expand the selected answer without changing
+  the saved answer length.
+- Follow up explicitly attaches the selected conversation branch to the next
+  question. It retains the original exchange plus the five most recent
+  exchanges and excludes unrelated history.
 
 Refinement controls start collapsed under **Refine or follow up** so the answer
 remains readable at the minimum window size.
@@ -67,7 +73,7 @@ context instead of reading changed settings.
 The stable system prefix contains the assistant contract, situation,
 instructions, and labeled reference data. Output preferences follow the cache
 breakpoint. The user message contains the current question, optional selected
-prior suggestion, question note, and refinement request. Background documents
+prior suggestions or conversation branch, question note, and refinement request. Background documents
 and transcripts are data, not behavioral instructions.
 
 Both providers use the same composition. Prompt caching requires a matching
@@ -78,15 +84,18 @@ history.
 Limits: 20 profiles; 80-character names; 16,000-character background;
 8,000-character instructions; 2,000-character question note; 1,000-character
 refinement. Related excerpts retain at most 1,000 question characters and 3,000
-answer characters. Legacy resume and job-description limits remain 200,000
+answer characters for refinements. Explicit conversation branches allow six turns,
+with at most 20,000 characters each for the question and answer. Global personal
+profile and custom instructions allow 12,000 and 8,000 characters respectively.
+Legacy resume and job-description limits remain 200,000
 characters each. The combined question and context limit is 435,000 characters;
 typed questions are limited to 8,000 and recorded transcripts to 32,000.
 Oversized requests are rejected rather than silently truncated;
-only explicitly selected follow-up excerpts are shortened.
+only explicitly selected related excerpts and conversation turns are shortened.
 
 ## Storage and reliability
 
-Legacy settings resolve to an Interview profile using the existing answer
+New installations default to brief answers. Legacy settings resolve to an Interview profile using the existing answer
 length, resume, and job description. Loading does not rewrite the file; the
 next successful settings save persists the migrated structure. Invalid profile
 fields fall back independently, preserving valid profiles and unrelated keys.
@@ -109,8 +118,8 @@ the minimum 380×520 layout, submissions, refinements, follow-ups, and key
 inputs, and saves screenshots under `artifacts/ui-smoke/`. Network requests
 are blocked and the user's real settings are not loaded.
 
-Manual Windows checks still cover real system audio, real provider latency,
-global shortcuts, and screen-capture protection. For answer quality, compare
+Manual Windows checks still cover real microphone/system audio, real provider
+latency, global shortcuts, and recording a visible practice window. For answer quality, compare
 the same supported-background question across interview/client/meeting modes,
 brief STAR versus brief talking points, technical versus nontechnical audience,
 and an explicit follow-up. Verify the requested distinction and unsupported-fact

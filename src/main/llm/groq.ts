@@ -1,58 +1,62 @@
-import type { AnswerStyle, AppError, ContextSnapshot } from '../../shared/types';
+import { DEFAULT_GROQ_MODEL, type AnswerStyle, type AppError, type ContextSnapshot } from '../../shared/types';
 import type { LlmProvider } from '../session';
-import { buildSystemPrompt, buildUserMessage, legacyContext } from '../prompt';
-import { parseSSEChunk, parseSSETail } from '../sse';
 import { retryOnceIf } from './retry';
+import { buildSystemPrompt, buildConversationMessages, contextForOptions, legacyContext, type PromptPersonalization } from '../prompt';
+import { parseSSEChunk, parseSSETail, type SseError, type SseUsage } from '../sse';
 
 // Groq — the user-selectable "fastest" preset. OpenAI-compatible SSE
 // streaming, parsed with the same battle-tested chunk parser v1 used for
-// DeepSeek.
+// DeepSeek. The model is a Settings pick from GROQ_MODELS (shared/types.ts);
+// `openai/gpt-oss-120b` is the default public production model.
 const API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-
-// Was `llama-3.3-70b-versatile`, which Groq announced as deprecated on
-// 2026-06-17 with a hard shutdown on 2026-08-16 — it would have started
-// returning errors within weeks. `openai/gpt-oss-120b` is Groq's own
-// recommended replacement for it, is on the production model list, and runs at
-// ~500 tok/s, which is what this preset is for.
-const MODEL = 'openai/gpt-oss-120b';
 
 // gpt-oss is a reasoning model, and reasoning is the enemy of time-to-first-word:
 // left alone it thinks before it answers, and the user stares at an empty panel.
 // `reasoning_effort: 'low'` keeps that to a minimum, and `include_reasoning:
 // false` keeps the reasoning out of the response entirely. Note gpt-oss does NOT
 // accept `reasoning_format` (that is the Qwen-family knob) — these two are the
-// supported controls for this model family.
+// supported controls for this model family. Non-reasoning models (the llama
+// entry) reject these params, so they are sent only to the gpt-oss family.
 const REASONING_EFFORT = 'low';
 
-// Parity with anthropic.ts's MAX_TOKENS. Spoken answers are short; an uncapped
-// runaway completion is pure tail latency (the panel keeps filling long after
-// the user has the answer they need) and burns tokens for nothing. Groq's
-// OpenAI-compatible API takes the newer `max_completion_tokens` name.
-const MAX_COMPLETION_TOKENS = 1024;
+// The cap includes reasoning tokens. Leave room for hidden reasoning as well
+// as the visible answer; the prompt controls the initial answer's concision.
+const MAX_COMPLETION_TOKENS = 2048;
+const DETAILED_COMPLETION_TOKENS = 4096;
 
 export function createGroqProvider(
   apiKey: string,
   contextOrResume: ContextSnapshot | string,
-  jd = '',
-  answerStyle: AnswerStyle = 'balanced',
+  jdOrModel = '',
+  answerStyle: AnswerStyle = 'brief',
+  legacyModel: string = DEFAULT_GROQ_MODEL,
+  personalization: PromptPersonalization = {},
 ): LlmProvider {
-  const context = typeof contextOrResume === 'string' ? legacyContext(contextOrResume, jd, answerStyle) : contextOrResume;
-  const system = buildSystemPrompt(context);
+  const model = typeof contextOrResume === 'string' ? legacyModel : jdOrModel || DEFAULT_GROQ_MODEL;
+  const savedContext = typeof contextOrResume === 'string' ? legacyContext(contextOrResume, jdOrModel, answerStyle, personalization) : contextOrResume;
+  const isReasoningModel = model.startsWith('openai/gpt-oss');
 
   return {
-    async generate(transcript, onDelta, signal) {
+    async generate(transcript, onDelta, signal, onUsage, options) {
+      const context = contextForOptions(savedContext, options);
+      const style = context.output.answerStyle;
+      const system = buildSystemPrompt(context);
       // Serialized once so a retry re-sends byte-identical bytes (and does not
       // pay JSON.stringify twice) — same shape as the Anthropic provider.
       const body = JSON.stringify({
-        model: MODEL,
+        model,
         stream: true,
         temperature: 0.7,
-        max_completion_tokens: MAX_COMPLETION_TOKENS,
-        reasoning_effort: REASONING_EFFORT,
-        include_reasoning: false,
+        max_completion_tokens: style === 'detailed' || (context.conversation?.length || context.relatedAnswer || context.refinement)
+          ? DETAILED_COMPLETION_TOKENS : MAX_COMPLETION_TOKENS,
+        ...(isReasoningModel ? { reasoning_effort: REASONING_EFFORT, include_reasoning: false } : {}),
+        // Ask for token accounting on the final chunk so the answer can carry
+        // a tokens chip. No cost estimate for Groq — pricing is not pinned
+        // here (see llm/pricing.ts), and a wrong number is worse than none.
+        stream_options: { include_usage: true },
         messages: [
           { role: 'system', content: system },
-          { role: 'user', content: buildUserMessage(transcript, context) },
+          ...buildConversationMessages(transcript, context.conversation, context),
         ],
       });
       const attempt = (): Promise<Response> =>
@@ -68,32 +72,17 @@ export function createGroqProvider(
 
       let res: Response;
       try {
-        // Retry parity with the Anthropic provider: a rejected fetch means the
-        // request never landed — no HTTP status, no bytes on screen — so one
-        // immediate retry is strictly better than an error mid-interview.
-        // This is deliberately scoped to the *initial* fetch: HTTP error
-        // statuses (401/429/5xx) resolve rather than reject and are never
-        // retried (the server heard us and said no — an instant retry just
-        // burns the first-token budget), and a mid-stream drop is handled
-        // below without a retry (the renderer appends deltas, so a second
-        // attempt would concatenate two answers).
         res = await retryOnceIf(attempt, () => !signal.aborted);
       } catch {
-        // fetch rejects with an AbortError when the session cancels us — also
-        // checked here in case the abort landed between the two attempts. That
-        // is not a failure the user should ever see.
         if (signal.aborted) throw abortedError();
-        throw {
-          code: 'llm_http',
-          message: 'Could not reach Groq. Check your internet connection.',
-        } satisfies AppError;
+        throw { code: 'llm_http', message: 'Could not reach Groq. Check your internet connection.' } satisfies AppError;
       }
 
       if (!res.ok) {
         // Reading the body can itself fail on a dropped connection; an error
         // about the error is not worth crashing over.
         const body = (await res.text().catch(() => '')).slice(0, 300);
-        throw httpError(res.status, body);
+        throw httpError(res.status, body, model);
       }
 
       // 200 with no body: `res.body!.getReader()` used to throw a raw
@@ -107,6 +96,7 @@ export function createGroqProvider(
       const decoder = new TextDecoder();
       let buf = '';
       let full = '';
+      let sseUsage: SseUsage | undefined;
       const emit = (delta: string): void => {
         full += delta;
         onDelta(delta);
@@ -114,19 +104,32 @@ export function createGroqProvider(
 
       try {
         for (;;) {
-          const { done, value } = await reader.read();
+          let chunk: Awaited<ReturnType<typeof reader.read>>;
+          try {
+            chunk = await reader.read();
+          } catch {
+            if (signal.aborted) throw abortedError();
+            throw {
+              code: 'llm_http',
+              message: 'The connection to Groq dropped while the answer was streaming.',
+            } satisfies AppError;
+          }
+          if (signal.aborted) throw abortedError();
+          const { done, value } = chunk;
           if (done) break;
           buf += decoder.decode(value, { stream: true });
-          const { deltas, rest } = parseSSEChunk(buf);
+          const { deltas, rest, usage, error, done: streamDone } = parseSSEChunk(buf);
           buf = rest;
+          if (usage) sseUsage = usage;
           for (const delta of deltas) emit(delta);
+          if (error) throw streamError(error);
+          if (streamDone) break;
         }
-      } catch (err) {
-        if (signal.aborted) throw abortedError();
-        throw {
-          code: 'llm_http',
-          message: 'The connection to Groq dropped while the answer was streaming.',
-        } satisfies AppError;
+      } finally {
+        // [DONE] ends the answer even if the server keeps the connection open.
+        // Also release the response when an SSE error terminates generation.
+        await reader.cancel().catch(() => {});
+        reader.releaseLock();
       }
 
       // Flush, in two steps, both of which drop characters if skipped:
@@ -135,7 +138,28 @@ export function createGroqProvider(
       //   parseSSETail(buf) — emits a final `data:` line that arrived without its
       //                       trailing newline, which parseSSEChunk cannot flush.
       buf += decoder.decode();
-      for (const delta of parseSSETail(buf)) emit(delta);
+      const tail = parseSSETail(buf);
+      if (tail.usage) sseUsage = tail.usage;
+      for (const delta of tail.deltas) emit(delta);
+      if (tail.error) throw streamError(tail.error);
+      if (signal.aborted) throw abortedError();
+      if (!full.trim()) {
+        throw {
+          code: 'llm_http',
+          message: 'Groq returned no answer text. Try again or choose another Groq model in Settings.',
+        } satisfies AppError;
+      }
+
+      if (sseUsage && typeof sseUsage.prompt_tokens === 'number' && typeof sseUsage.completion_tokens === 'number') {
+        onUsage?.({
+          model,
+          inputTokens: sseUsage.prompt_tokens,
+          outputTokens: sseUsage.completion_tokens,
+          cacheReadTokens: 0, // no prompt caching on this path
+          cacheWriteTokens: 0,
+          // estCostUsd deliberately absent: Groq pricing is not pinned here.
+        });
+      }
 
       return full;
     },
@@ -146,11 +170,26 @@ function abortedError(): AppError {
   return { code: 'aborted', message: 'Answer cancelled.' };
 }
 
-function httpError(status: number, body: string): AppError {
-  if (status === 401 || status === 403) {
-    // Both are key problems, but report the status we actually got — a 403
-    // labelled "(401)" sends the user debugging the wrong thing.
+function streamError(error: SseError): AppError {
+  if (error.code === 'rate_limit_exceeded' || error.type === 'rate_limit_error') {
+    return httpError(429, '', '');
+  }
+  const detail = typeof error.message === 'string' ? error.message.slice(0, 300).trim() : '';
+  return {
+    code: 'llm_http',
+    message: detail ? `Groq could not finish the answer: ${detail}` : 'Groq could not finish the answer. Try again.',
+  };
+}
+
+function httpError(status: number, body: string, model: string): AppError {
+  if (status === 401) {
     return { code: 'llm_auth', message: `Groq rejected the API key (HTTP ${status}). Check it in Settings.` };
+  }
+  if (status === 403) {
+    return {
+      code: 'llm_auth',
+      message: `Groq denied access to "${model}" (HTTP 403). Check your Groq model permissions or choose another model in Settings.`,
+    };
   }
   if (status === 429) {
     return {
@@ -162,7 +201,7 @@ function httpError(status: number, body: string): AppError {
     // Most likely cause here is Groq retiring the pinned model out from under us.
     return {
       code: 'llm_http',
-      message: `Groq does not recognise the model "${MODEL}" (404). It may have been retired — update MODEL in llm/groq.ts.`,
+      message: `Groq does not recognise the model "${model}" (404). It may have been retired — pick a different Groq model in Settings.`,
     };
   }
   if (status >= 500) {

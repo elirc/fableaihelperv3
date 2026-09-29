@@ -30,6 +30,11 @@ const relatedAnswerSchema = z.object({
   answer: z.string().max(limits.relatedAnswer),
 }).strict();
 
+const conversationSchema = z.array(z.object({
+  question: z.string().trim().min(1).max(limits.conversationQuestion),
+  answer: z.string().trim().min(1).max(limits.conversationAnswer),
+}).strict()).max(limits.conversationTurns);
+
 export const contextSnapshotSchema = z.object({
   profileId: z.string().min(1).max(limits.id),
   profileName: z.string().min(1).max(limits.name),
@@ -38,6 +43,9 @@ export const contextSnapshotSchema = z.object({
   instructions: z.string().max(limits.instructions),
   resume: z.string().max(limits.resume),
   jobDescription: z.string().max(limits.jobDescription),
+  personalProfile: z.string().max(limits.personalProfile).optional(),
+  customInstructions: z.string().max(limits.customInstructions).optional(),
+  conversation: conversationSchema.optional(),
   output: outputPreferencesSchema,
   questionNote: z.string().max(limits.questionNote),
   relatedAnswer: relatedAnswerSchema.optional(),
@@ -46,6 +54,8 @@ export const contextSnapshotSchema = z.object({
   'The combined context is too large. Shorten the background or reference material.');
 
 export const answerOptionsSchema = z.object({
+  context: conversationSchema.optional(),
+  answerStyle: z.enum(['brief', 'balanced', 'detailed']).optional(),
   profileId: z.string().min(1).max(limits.id).optional(),
   overrides: outputOverridesSchema.optional(),
   questionNote: z.string().max(limits.questionNote).optional(),

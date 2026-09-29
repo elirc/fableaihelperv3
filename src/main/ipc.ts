@@ -1,5 +1,6 @@
 import { BrowserWindow, ipcMain } from 'electron';
 import { z } from 'zod';
+import { ANTHROPIC_MODELS, GROQ_MODELS, DEFAULT_ANTHROPIC_MODEL, DEFAULT_GROQ_MODEL } from '../shared/types';
 import type { AppError, ContextSnapshot, LlmProviderId, Result } from '../shared/types';
 import { CONTEXT_LIMITS, resolveContext } from '../shared/context';
 import { answerOptionsSchema, contextSnapshotSchema, contextProfilesSchema, outputPreferencesSchema } from './context-schema';
@@ -12,6 +13,11 @@ import { warmLlmConnection } from './llm/warm';
 
 const settingsPatchSchema = z
   .object({
+    personalProfile: z.string().max(12_000),
+    customInstructions: z.string().max(8_000),
+    anthropicModel: z.enum(ANTHROPIC_MODELS),
+    groqModel: z.enum(GROQ_MODELS),
+    audioSource: z.enum(['microphone', 'system']),
     resume: z.string().max(200_000),
     jobDescription: z.string().max(200_000),
     alwaysOnTop: z.boolean(),
@@ -61,7 +67,7 @@ async function createStt(): Promise<SttStream> {
   return DeepgramStream.connect(key);
 }
 
-function createLlm(context?: ContextSnapshot, provider?: LlmProviderId): LlmProvider {
+function createLlm(context?: ContextSnapshot, provider?: LlmProviderId, model?: string): LlmProvider {
   const llmProvider = provider ?? store.getProfile().llmProvider;
   const snapshot = context ?? resolveContext(store.getSettingsView());
   if (llmProvider === 'groq') {
@@ -72,7 +78,7 @@ function createLlm(context?: ContextSnapshot, provider?: LlmProviderId): LlmProv
         message: 'Groq API key is not set. Open Settings (gear icon) and add it, or switch the provider.',
       } satisfies AppError;
     }
-    return createGroqProvider(key, snapshot);
+    return createGroqProvider(key, snapshot, model ?? DEFAULT_GROQ_MODEL);
   }
   const key = store.getSecret('anthropicKey');
   if (!key) {
@@ -81,7 +87,7 @@ function createLlm(context?: ContextSnapshot, provider?: LlmProviderId): LlmProv
       message: 'Anthropic API key is not set. Open Settings (gear icon) and add it.',
     } satisfies AppError;
   }
-  return createAnthropicProvider(key, snapshot);
+  return createAnthropicProvider(key, snapshot, model ?? DEFAULT_ANTHROPIC_MODEL);
 }
 
 /**
@@ -131,7 +137,7 @@ export function registerIpc(getWin: () => BrowserWindow | null, applyHotkey: () 
       const context = contextSnapshotSchema.parse(resolveContext(settings, options));
       const provider = settings.llmProvider;
       warmLlmConnection(provider);
-      return ok(await sessions.start(context, provider));
+      return ok(await sessions.start(context, provider, provider === 'groq' ? settings.groqModel ?? DEFAULT_GROQ_MODEL : settings.anthropicModel ?? DEFAULT_ANTHROPIC_MODEL));
     } catch (err) {
       return fail(requestError(err, 'stt_connect'));
     }
@@ -147,7 +153,7 @@ export function registerIpc(getWin: () => BrowserWindow | null, applyHotkey: () 
       const context = contextSnapshotSchema.parse(resolveContext(settings, options));
       const provider = settings.llmProvider;
       warmLlmConnection(provider);
-      return ok(await sessions.ask(text, context, provider));
+      return ok(await sessions.ask(text, context, provider, provider === 'groq' ? settings.groqModel ?? DEFAULT_GROQ_MODEL : settings.anthropicModel ?? DEFAULT_ANTHROPIC_MODEL));
     } catch (err) {
       return fail(requestError(err, 'internal'));
     }

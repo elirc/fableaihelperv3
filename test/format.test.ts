@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'vitest';
 import type { AnswerMetrics } from '../src/shared/types';
 import {
+  costLabel,
+  costTitle,
   errorMessage,
   formatAccelerator,
   formatTimer,
@@ -285,5 +287,64 @@ describe('latencyTitle edge cases', () => {
     expect(latencyTitle(metrics(0, 0, 0))).toBe(
       'First token received 0 ms after Stop / Ask · transcript finalized 0 ms · full answer 0.0 s',
     );
+  });
+});
+
+describe('costLabel / costTitle', () => {
+  const base = { sttFinalizeMs: 100, firstTokenMs: 800, totalMs: 2000 };
+  const usage = (over: object = {}) => ({
+    model: 'claude-haiku-4-5',
+    inputTokens: 1500,
+    outputTokens: 300,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    estCostUsd: 0.003,
+    ...over,
+  });
+
+  test('empty when the provider reported no usage (chip hides itself)', () => {
+    expect(costLabel(base)).toBe('');
+    expect(costTitle(base)).toBe('');
+  });
+
+  test('shows dollars to four decimals when a cost estimate exists', () => {
+    expect(costLabel({ ...base, usage: usage() })).toBe('$0.0030');
+  });
+
+  test('four decimals keep sub-cent answers visible instead of "$0.00"', () => {
+    expect(costLabel({ ...base, usage: usage({ estCostUsd: 0.0004 }) })).toBe('$0.0004');
+  });
+
+  test('falls back to a token count when pricing is not pinned (Groq)', () => {
+    const label = costLabel({
+      ...base,
+      usage: usage({ model: 'openai/gpt-oss-120b', estCostUsd: undefined }),
+    });
+    expect(label).toBe('1500→300 tok');
+  });
+
+  test('token fallback counts cached tokens as input — they were real prompt tokens', () => {
+    const label = costLabel({
+      ...base,
+      usage: usage({ estCostUsd: undefined, inputTokens: 100, cacheReadTokens: 900 }),
+    });
+    expect(label).toBe('1000→300 tok');
+  });
+
+  test('title names the model and the in/out split', () => {
+    const title = costTitle({ ...base, usage: usage() });
+    expect(title).toContain('claude-haiku-4-5');
+    expect(title).toContain('1500 in / 300 out');
+  });
+
+  test('title mentions cache lines only when caching actually engaged', () => {
+    expect(costTitle({ ...base, usage: usage() })).not.toMatch(/cache/i);
+    const engaged = costTitle({ ...base, usage: usage({ cacheReadTokens: 1200 }) });
+    expect(engaged).toContain('1200 cached read (0.1x)');
+  });
+
+  test('title explains an absent estimate instead of leaving a bare token count', () => {
+    const title = costTitle({ ...base, usage: usage({ estCostUsd: undefined }) });
+    expect(title).toMatch(/pricing not pinned/i);
   });
 });

@@ -15,7 +15,7 @@ function drain(body: string, chunkSize = body.length): string[] {
     buf = rest;
     out.push(...deltas);
   }
-  out.push(...parseSSETail(buf));
+  out.push(...parseSSETail(buf).deltas);
   return out;
 }
 
@@ -89,6 +89,22 @@ describe('parseSSEChunk', () => {
     expect(deltas).toEqual(['ok']);
   });
 
+  test('ignores non-string content instead of emitting objects as answer text', () => {
+    const invalid = 'data: ' + JSON.stringify({ choices: [{ delta: { content: { text: 'bad' } } }] }) + '\n';
+    expect(parseSSEChunk(invalid + dataLine('ok')).deltas).toEqual(['ok']);
+  });
+
+  test('surfaces an SSE error after any preceding content and stops at the error', () => {
+    const error = { message: 'Generation failed', code: 'server_error' };
+    const chunk = dataLine('partial') + 'data: ' + JSON.stringify({ error }) + '\n' + dataLine('ignored');
+    expect(parseSSEChunk(chunk)).toEqual({ deltas: ['partial'], rest: '', error });
+  });
+
+  test('marks DONE and ignores any trailing content in the same chunk', () => {
+    expect(parseSSEChunk(dataLine('answer') + 'data: [DONE]\n' + dataLine('ignored')))
+      .toEqual({ deltas: ['answer'], rest: '', done: true });
+  });
+
   test('ignores event: lines (only data: lines carry content)', () => {
     const { deltas } = parseSSEChunk('event: message\n' + dataLine('x'));
     expect(deltas).toEqual(['x']);
@@ -126,7 +142,7 @@ describe('parseSSETail', () => {
     const body = dataLine('Hello') + 'data: ' + JSON.stringify({ choices: [{ delta: { content: ' world' } }] });
     const { deltas, rest } = parseSSEChunk(body);
     expect(deltas).toEqual(['Hello']); // the last delta is NOT here...
-    expect(parseSSETail(rest)).toEqual([' world']); // ...it is only recovered by the flush
+    expect(parseSSETail(rest).deltas).toEqual([' world']); // ...it is only recovered by the flush
   });
 
   test('an unterminated stream loses nothing end to end', () => {
@@ -135,13 +151,13 @@ describe('parseSSETail', () => {
   });
 
   test('returns nothing for an empty or whitespace-only tail', () => {
-    expect(parseSSETail('')).toEqual([]);
-    expect(parseSSETail('\n')).toEqual([]);
-    expect(parseSSETail('   ')).toEqual([]);
+    expect(parseSSETail('').deltas).toEqual([]);
+    expect(parseSSETail('\n').deltas).toEqual([]);
+    expect(parseSSETail('   ').deltas).toEqual([]);
   });
 
   test('discards a genuinely truncated JSON payload instead of throwing', () => {
-    expect(parseSSETail('data: {"choices":[{"delta":{"cont')).toEqual([]);
+    expect(parseSSETail('data: {"choices":[{"delta":{"cont').deltas).toEqual([]);
   });
 
   test('does not double-emit when the stream ended cleanly with [DONE]', () => {
@@ -150,15 +166,20 @@ describe('parseSSETail', () => {
   });
 
   test('is idempotent for a tail that is already newline-terminated', () => {
-    expect(parseSSETail(dataLine('x'))).toEqual(['x']);
+    expect(parseSSETail(dataLine('x')).deltas).toEqual(['x']);
   });
 
   test('ignores a tail that is only the [DONE] sentinel without a newline', () => {
-    expect(parseSSETail('data: [DONE]')).toEqual([]);
+    expect(parseSSETail('data: [DONE]').deltas).toEqual([]);
   });
 
   test('ignores a comment-only tail', () => {
-    expect(parseSSETail(': keep-alive')).toEqual([]);
+    expect(parseSSETail(': keep-alive').deltas).toEqual([]);
+  });
+
+  test('surfaces an error delivered without a trailing newline', () => {
+    expect(parseSSETail('data: {"error":{"message":"Generation failed"}}'))
+      .toEqual({ deltas: [], error: { message: 'Generation failed' } });
   });
 });
 
@@ -187,7 +208,7 @@ describe('end-to-end chunking', () => {
       const first = parseSSEChunk(body.slice(0, cut));
       const second = parseSSEChunk(first.rest + body.slice(cut));
       const tail = parseSSETail(second.rest);
-      expect([...first.deltas, ...second.deltas, ...tail]).toEqual(expected);
+      expect([...first.deltas, ...second.deltas, ...tail.deltas]).toEqual(expected);
     }
   });
 });
@@ -198,7 +219,7 @@ describe('parseSSEChunk buffer bookkeeping', () => {
     // the stream closes. Treating it as end-of-parse would drop any bytes an
     // unusual server (or a coalescing proxy) packed after it.
     const { deltas, rest } = parseSSEChunk(dataLine('a') + 'data: [DONE]\n' + dataLine('b'));
-    expect(deltas).toEqual(['a', 'b']);
+    expect(deltas).toEqual(['a']);
     expect(rest).toBe('');
   });
 
@@ -232,6 +253,44 @@ describe('parseSSETail line endings', () => {
     // A CRLF stream truncated between the \r and the \n leaves the \r in the
     // tail; the flush must still strip it and recover the delta.
     const line = 'data: ' + JSON.stringify({ choices: [{ delta: { content: 'end' } }] }) + '\r';
-    expect(parseSSETail(line)).toEqual(['end']);
+    expect(parseSSETail(line).deltas).toEqual(['end']);
+  });
+});
+
+describe('usage extraction', () => {
+  const usageChunk = (u: object) => 'data: ' + JSON.stringify({ choices: [], usage: u }) + '\n';
+
+  test('surfaces the usage object from a final chunk', () => {
+    const body = dataLine('hi') + usageChunk({ prompt_tokens: 12, completion_tokens: 3 });
+    const { deltas, usage } = parseSSEChunk(body);
+    expect(deltas).toEqual(['hi']);
+    expect(usage).toEqual({ prompt_tokens: 12, completion_tokens: 3 });
+  });
+
+  test('omits the usage key entirely when no chunk carried one', () => {
+    const result = parseSSEChunk(dataLine('hi'));
+    expect('usage' in result).toBe(false);
+  });
+
+  test("reads Groq's x_groq mirror when the top-level usage is absent", () => {
+    const line = 'data: ' + JSON.stringify({ choices: [], x_groq: { usage: { prompt_tokens: 7, completion_tokens: 2 } } }) + '\n';
+    expect(parseSSEChunk(line).usage).toEqual({ prompt_tokens: 7, completion_tokens: 2 });
+  });
+
+  test('the last usage seen wins when several chunks carry one', () => {
+    const body = usageChunk({ prompt_tokens: 1, completion_tokens: 0 }) + usageChunk({ prompt_tokens: 12, completion_tokens: 5 });
+    expect(parseSSEChunk(body).usage).toEqual({ prompt_tokens: 12, completion_tokens: 5 });
+  });
+
+  test('recovers usage from an unterminated tail line', () => {
+    const tail = 'data: ' + JSON.stringify({ choices: [], usage: { prompt_tokens: 9, completion_tokens: 4 } });
+    const { deltas, usage } = parseSSETail(tail);
+    expect(deltas).toEqual([]);
+    expect(usage).toEqual({ prompt_tokens: 9, completion_tokens: 4 });
+  });
+
+  test('a non-object usage value is ignored', () => {
+    const line = 'data: ' + JSON.stringify({ choices: [], usage: 'lots' }) + '\n';
+    expect('usage' in parseSSEChunk(line)).toBe(false);
   });
 });

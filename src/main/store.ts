@@ -3,8 +3,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import {
+  ANTHROPIC_MODELS,
+  DEFAULT_ANTHROPIC_MODEL,
+  DEFAULT_GROQ_MODEL,
   DEFAULT_HOTKEY,
+  GROQ_MODELS,
   type AnswerStyle,
+  type AnthropicModelId,
+  type AudioSource,
+  type GroqModelId,
   type LlmProviderId,
   type SettingsPatch,
   type SettingsView,
@@ -15,7 +22,9 @@ import { createDefaultProfile, createProfile, DEFAULT_OUTPUT } from '../shared/c
 import { contextProfilesSchema, outputPreferencesSchema, scenarioProfileSchema } from './context-schema';
 import type { WindowBounds } from './bounds';
 
-// JSON settings store in %APPDATA%/AI Call Assistant/settings.json.
+// JSON settings store in %APPDATA%/AI Call Assistant/settings.json. The
+// directory keeps the v1 productName on purpose (see README): renaming it would
+// move userData and silently orphan the user's encrypted keys and profile.
 // Plain fields are stored as-is; API keys are encrypted with Electron
 // safeStorage (DPAPI on Windows) and stored base64 under `secrets`.
 // Keys are never returned to the renderer — SettingsView carries hasKey flags only.
@@ -23,8 +32,13 @@ import type { WindowBounds } from './bounds';
 interface StoreShape {
   resume: string;
   jobDescription: string;
+  personalProfile: string;
+  customInstructions: string;
   alwaysOnTop: boolean;
   llmProvider: LlmProviderId;
+  anthropicModel: AnthropicModelId;
+  groqModel: GroqModelId;
+  audioSource: AudioSource;
   answerStyle: AnswerStyle;
   /** Electron accelerator; empty string means "no global shortcut". */
   hotkey: string;
@@ -43,13 +57,18 @@ function freshDefaults(): StoreShape {
   return {
     resume: '',
     jobDescription: '',
+    personalProfile: '',
+    customInstructions: '',
     alwaysOnTop: true,
     llmProvider: 'anthropic',
-    answerStyle: 'balanced',
+    anthropicModel: DEFAULT_ANTHROPIC_MODEL,
+    groqModel: DEFAULT_GROQ_MODEL,
+    audioSource: 'microphone',
+    answerStyle: 'brief',
     hotkey: DEFAULT_HOTKEY,
-    contextProfiles: [createDefaultProfile()],
+    contextProfiles: [createDefaultProfile('brief')],
     activeProfileId: 'interview',
-    outputDefaults: { ...DEFAULT_OUTPUT },
+    outputDefaults: { ...DEFAULT_OUTPUT, answerStyle: 'brief' },
     secrets: {},
   };
 }
@@ -60,9 +79,16 @@ function freshDefaults(): StoreShape {
 const persistedSchema = z.object({
   resume: z.string().catch(''),
   jobDescription: z.string().catch(''),
+  personalProfile: z.string().max(12_000).catch(''),
+  customInstructions: z.string().max(8_000).catch(''),
   alwaysOnTop: z.boolean().catch(true),
   llmProvider: z.enum(['anthropic', 'groq']).catch('anthropic'),
-  answerStyle: z.enum(['brief', 'balanced', 'detailed']).catch('balanced'),
+  // Model picks fall back to the defaults rather than failing: an entry removed
+  // from the curated list in a future version must not brick the settings file.
+  anthropicModel: z.enum(ANTHROPIC_MODELS).catch(DEFAULT_ANTHROPIC_MODEL),
+  groqModel: z.enum(GROQ_MODELS).catch(DEFAULT_GROQ_MODEL),
+  audioSource: z.enum(['microphone', 'system']).catch('microphone'),
+  answerStyle: z.enum(['brief', 'balanced', 'detailed']).catch('brief'),
   hotkey: z.string().catch(DEFAULT_HOTKEY),
   contextProfiles: z.unknown().optional(),
   activeProfileId: z.unknown().optional(),
@@ -160,8 +186,13 @@ function readFromDisk(): StoreShape {
   return {
     resume: d.resume,
     jobDescription: d.jobDescription,
+    personalProfile: d.personalProfile,
+    customInstructions: d.customInstructions,
     alwaysOnTop: d.alwaysOnTop,
     llmProvider: d.llmProvider,
+    anthropicModel: d.anthropicModel,
+    groqModel: d.groqModel,
+    audioSource: d.audioSource,
     answerStyle: d.answerStyle,
     hotkey: d.hotkey,
     contextProfiles,
@@ -231,8 +262,13 @@ export function getSettingsView(): SettingsView {
   return {
     resume: s.resume,
     jobDescription: s.jobDescription,
+    personalProfile: s.personalProfile,
+    customInstructions: s.customInstructions,
     alwaysOnTop: s.alwaysOnTop,
     llmProvider: s.llmProvider,
+    anthropicModel: s.anthropicModel,
+    groqModel: s.groqModel,
+    audioSource: s.audioSource,
     answerStyle: s.answerStyle,
     hotkey: s.hotkey,
     hotkeyRegistered,
@@ -260,6 +296,8 @@ export function applySettingsPatch(patch: SettingsPatch): SettingsView {
   }
   if (patch.resume !== undefined) s.resume = patch.resume;
   if (patch.jobDescription !== undefined) s.jobDescription = patch.jobDescription;
+  if (patch.personalProfile !== undefined) s.personalProfile = patch.personalProfile;
+  if (patch.customInstructions !== undefined) s.customInstructions = patch.customInstructions;
   if (patch.alwaysOnTop !== undefined) s.alwaysOnTop = patch.alwaysOnTop;
   if (patch.llmProvider !== undefined) s.llmProvider = patch.llmProvider;
   if (patch.answerStyle !== undefined) {
@@ -270,6 +308,9 @@ export function applySettingsPatch(patch: SettingsPatch): SettingsView {
       if (activeProfile) activeProfile.output.answerStyle = patch.answerStyle;
     }
   }
+  if (patch.anthropicModel !== undefined) s.anthropicModel = patch.anthropicModel;
+  if (patch.groqModel !== undefined) s.groqModel = patch.groqModel;
+  if (patch.audioSource !== undefined) s.audioSource = patch.audioSource;
   if (patch.hotkey !== undefined) s.hotkey = patch.hotkey.trim();
   for (const key of ['deepgramKey', 'anthropicKey', 'groqKey'] as const) {
     const v = patch[key];
@@ -292,14 +333,22 @@ export function getSecret(key: 'deepgramKey' | 'anthropicKey' | 'groqKey'): stri
 export function getProfile(): {
   resume: string;
   jobDescription: string;
+  personalProfile: string;
+  customInstructions: string;
   llmProvider: LlmProviderId;
+  anthropicModel: AnthropicModelId;
+  groqModel: GroqModelId;
   answerStyle: AnswerStyle;
 } {
   const s = load();
   return {
     resume: s.resume,
     jobDescription: s.jobDescription,
+    personalProfile: s.personalProfile,
+    customInstructions: s.customInstructions,
     llmProvider: s.llmProvider,
+    anthropicModel: s.anthropicModel,
+    groqModel: s.groqModel,
     answerStyle: s.answerStyle,
   };
 }
