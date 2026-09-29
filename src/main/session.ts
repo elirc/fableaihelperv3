@@ -1,5 +1,7 @@
 import { performance } from 'node:perf_hooks';
-import type { AnswerMetrics, AppError } from '../shared/types';
+import type { AnswerMetrics, AppError, ContextSnapshot, LlmProviderId } from '../shared/types';
+import { CONTEXT_LIMITS, contextCharacters } from '../shared/context';
+import { contextSnapshotSchema } from './context-schema';
 
 // One live question/answer pipeline. The manager owns exactly one active
 // session; starting a new one aborts the old, which is what makes
@@ -28,13 +30,13 @@ export interface LlmProvider {
 export interface SessionEvents {
   onSttPartial(sessionId: number, text: string, isFinal: boolean): void;
   onLlmDelta(sessionId: number, delta: string): void;
-  onLlmDone(sessionId: number, transcript: string, answer: string, metrics: AnswerMetrics): void;
+  onLlmDone(sessionId: number, transcript: string, answer: string, metrics: AnswerMetrics, context?: ContextSnapshot): void;
   onError(sessionId: number, error: AppError): void;
 }
 
 export interface SessionDeps {
   createStt(): Promise<SttStream>;
-  createLlm(): LlmProvider;
+  createLlm(context?: ContextSnapshot, provider?: LlmProviderId): LlmProvider;
   events: SessionEvents;
   timeouts?: Partial<Timeouts>;
 }
@@ -63,6 +65,8 @@ export function toAppError(err: unknown, fallbackCode: AppError['code'] = 'inter
 
 interface ActiveSession {
   id: number;
+  context?: ContextSnapshot;
+  provider?: LlmProviderId;
   /** Null for ask() sessions: the question arrived as text, nothing to record. */
   stt: SttStream | null;
   abort: AbortController;
@@ -85,7 +89,8 @@ export class SessionManager {
   }
 
   /** Start a new session, aborting any previous one. Resolves once STT is connected. */
-  async start(): Promise<number> {
+  async start(context?: ContextSnapshot, provider?: LlmProviderId): Promise<number> {
+    const snapshot = this.snapshot(context);
     this.cancelActive();
     const id = this.nextId++;
     // Claim "newest start" before the await. createStt() is a network round-trip,
@@ -101,11 +106,23 @@ export class SessionManager {
     // Install before wiring: a stream that died while we were connecting
     // delivers its queued error synchronously from onError(), and that error
     // must find a live session to tear down instead of being dropped.
-    this.active = { id, stt, abort, stopped: false, transcriptFinal: false };
+    this.active = { id, stt, abort, stopped: false, transcriptFinal: false, context: snapshot, provider };
     stt.onPartial((text, isFinal) => {
       if (this.active?.id === id) this.deps.events.onSttPartial(id, text, isFinal);
     });
-    stt.onError((err) => this.handleSttError(id, err));
+    // A queued connect-time error must reject start itself: the renderer has
+    // not received this id yet and cannot reliably adopt a session:error event.
+    let wiring = true;
+    let connectError: AppError | undefined;
+    stt.onError((err) => {
+      if (wiring) connectError = toAppError(err, 'stt_error');
+      else this.handleSttError(id, err);
+    });
+    wiring = false;
+    if (connectError) {
+      this.cancelActive();
+      throw connectError;
+    }
     return id;
   }
 
@@ -122,16 +139,18 @@ export class SessionManager {
    * onLlmDelta per token, and onLlmDone (or onError). Metrics are measured from
    * this call, with sttFinalizeMs pinned to 0 since nothing was finalized.
    */
-  async ask(text: string): Promise<number> {
+  async ask(text: string, context?: ContextSnapshot, provider?: LlmProviderId): Promise<number> {
     // The latency clock starts the moment the user submits the question.
     const t0 = performance.now();
-    const trimmed = text.trim();
+    const trimmed = typeof text === 'string' ? text.trim() : '';
+    const snapshot = this.snapshot(context);
     // ipc validates too; stay defensive so no caller can launch an LLM run on
     // an empty prompt. Checked before cancelActive: invalid input must not
     // kill a session that is mid-flight.
-    if (!trimmed) {
-      throw { code: 'internal', message: 'Cannot ask an empty question.' } satisfies AppError;
+    if (!trimmed || trimmed.length > 8_000) {
+      throw { code: 'internal', message: 'Question must contain between 1 and 8,000 characters.' } satisfies AppError;
     }
+    this.validateRequestSize(trimmed, snapshot);
     this.cancelActive();
     const id = this.nextId++;
     // Claim "newest" exactly like start(): an in-flight start() that resolves
@@ -139,6 +158,8 @@ export class SessionManager {
     this.latestStartId = id;
     const s: ActiveSession = {
       id,
+      context: snapshot,
+      provider,
       stt: null, // the question arrived as text — nothing to record or finalize
       abort: new AbortController(),
       stopped: true, // there is no recording to stop; audio() must be a no-op
@@ -151,35 +172,13 @@ export class SessionManager {
     return id;
   }
 
-  private async runAsk(s: ActiveSession, transcript: string, t0: number): Promise<void> {
-    const sessionId = s.id;
-    const since = () => Math.round(performance.now() - t0);
-    let firstTokenMs: number | null = null;
-    try {
-      if (this.isStale(sessionId)) return; // cancelled/replaced before the tick fired
-      // The renderer keys everything off the recorded-session event shape, so
-      // the question goes out as an already-final transcript.
-      this.deps.events.onSttPartial(sessionId, transcript, true);
-      const llm = this.deps.createLlm();
-      const answer = await this.runLlm(s, transcript, llm, () => {
-        firstTokenMs = since();
-      });
-      if (this.isStale(sessionId)) return;
-      const totalMs = since();
-      this.deps.events.onLlmDone(sessionId, transcript, answer, {
-        sttFinalizeMs: 0, // no STT stage: reporting anything else would be a lie
-        // Same rule as runStop: a provider that never streamed a delta had no
-        // "first token" moment, and 0 would read as instant.
-        firstTokenMs: firstTokenMs ?? totalMs,
-        totalMs,
-      });
-    } catch (err) {
-      if (this.isStale(sessionId)) return;
-      const appErr = toAppError(err);
-      if (appErr.code !== 'aborted') this.deps.events.onError(sessionId, appErr);
-    } finally {
-      if (this.active?.id === sessionId) this.active = null;
-    }
+  private runAsk(s: ActiveSession, transcript: string, t0: number): Promise<void> {
+    return this.runGuarded(s.id, async () => {
+      if (this.isStale(s.id)) return; // cancelled/replaced before the tick fired
+      // sttFinalizeMs pinned to 0: no STT stage ran, reporting anything else
+      // would be a lie.
+      await this.streamAnswer(s, transcript, t0, 0);
+    });
   }
 
   /**
@@ -201,15 +200,12 @@ export class SessionManager {
     return true;
   }
 
-  private async runStop(s: ActiveSession, stt: SttStream, sessionId: number): Promise<void> {
+  private runStop(s: ActiveSession, stt: SttStream, sessionId: number): Promise<void> {
     // The only clock that matters: the user pressed stop and is now waiting.
     const t0 = performance.now();
-    const since = () => Math.round(performance.now() - t0);
-    let firstTokenMs: number | null = null;
-
-    try {
+    return this.runGuarded(sessionId, async () => {
       const transcript = (await stt.finalize(this.timeouts.sttFinalizeMs)).trim();
-      const sttFinalizeMs = since();
+      const sttFinalizeMs = Math.round(performance.now() - t0);
       if (this.isStale(sessionId)) return;
       s.transcriptFinal = true;
       if (!transcript) {
@@ -218,24 +214,75 @@ export class SessionManager {
           message: 'No speech detected in the recording. Make sure call audio is playing.',
         } satisfies AppError;
       }
-      this.deps.events.onSttPartial(sessionId, transcript, true);
+      await this.streamAnswer(s, transcript, t0, sttFinalizeMs);
+    });
+  }
 
-      const llm = this.deps.createLlm();
-      const answer = await this.runLlm(s, transcript, llm, () => {
-        firstTokenMs = since();
-      });
-      if (this.isStale(sessionId)) return;
-      const totalMs = since();
-      this.deps.events.onLlmDone(sessionId, transcript, answer, {
-        sttFinalizeMs,
-        // A provider that returns the whole answer without ever streaming a
-        // delta had no "first token" moment; reporting 0 would read as instant.
-        firstTokenMs: firstTokenMs ?? totalMs,
-        totalMs,
-      });
+  /**
+   * The tail every pipeline shares once it holds a final transcript: echo it as
+   * one final partial, stream the answer, report metrics against the caller's
+   * clock (t0 = the moment the user acted, so recording time never leaks in).
+   */
+  private async streamAnswer(
+    s: ActiveSession,
+    transcript: string,
+    t0: number,
+    sttFinalizeMs: number,
+  ): Promise<void> {
+    this.validateRequestSize(transcript, s.context);
+    const since = () => Math.round(performance.now() - t0);
+    let firstTokenMs: number | null = null;
+    // The renderer keys everything off the recorded-session event shape, so
+    // the transcript always goes out as one already-final partial.
+    this.deps.events.onSttPartial(s.id, transcript, true);
+    const llm = this.deps.createLlm(s.context, s.provider);
+    const answer = await this.runLlm(s, transcript, llm, () => {
+      firstTokenMs = since();
+    });
+    if (this.isStale(s.id)) return;
+    const totalMs = since();
+    this.deps.events.onLlmDone(s.id, transcript, answer, {
+      sttFinalizeMs,
+      // A provider that returns the whole answer without ever streaming a
+      // delta had no "first token" moment; reporting 0 would read as instant.
+      firstTokenMs: firstTokenMs ?? totalMs,
+      totalMs,
+    }, s.context);
+  }
+
+  private snapshot(context?: ContextSnapshot): ContextSnapshot | undefined {
+    if (!context) return undefined;
+    // Parsing copies nested objects and validates before the live session is
+    // superseded. Freeze to prevent accidental mutation by a provider or caller.
+    const snapshot = contextSnapshotSchema.parse(context);
+    Object.freeze(snapshot.output);
+    if (snapshot.relatedAnswer) Object.freeze(snapshot.relatedAnswer);
+    return Object.freeze(snapshot);
+  }
+
+  private validateRequestSize(transcript: string, context?: ContextSnapshot): void {
+    if (transcript.length > 32_000 || transcript.length + (context ? contextCharacters(context) : 0) > CONTEXT_LIMITS.total) {
+      throw { code: 'internal', message: 'This answer request is too large. Shorten the question or background.' } satisfies AppError;
+    }
+  }
+
+  /**
+   * The error/teardown contract every pipeline runs under, in one place so the
+   * ask and stop paths cannot drift: an error for a session that was replaced
+   * or cancelled is dropped (the user moved on), 'aborted' is silent even for
+   * the live session (the user asked for it), anything else reaches the
+   * renderer as a structured event — and the slot is released exactly once, but
+   * only if this session still owns it.
+   */
+  private async runGuarded(sessionId: number, pipeline: () => Promise<void>): Promise<void> {
+    try {
+      await pipeline();
     } catch (err) {
       if (this.isStale(sessionId)) return;
       const appErr = toAppError(err);
+      // A finalize/provider/validation failure is terminal too. A provider is
+      // not required to close its transport before rejecting; release it here.
+      this.cancelActive();
       if (appErr.code !== 'aborted') this.deps.events.onError(sessionId, appErr);
     } finally {
       if (this.active?.id === sessionId) this.active = null;
@@ -244,6 +291,10 @@ export class SessionManager {
 
   cancel(sessionId: number): void {
     if (this.active?.id === sessionId) this.cancelActive();
+  }
+
+  providerFor(sessionId: number): LlmProviderId | undefined {
+    return this.active?.id === sessionId ? this.active.provider : undefined;
   }
 
   // The STT stream died by itself (socket close, provider error). While we are
@@ -298,6 +349,7 @@ export class SessionManager {
       const cleanup = () => {
         clearTimeout(firstTokenTimer);
         clearTimeout(totalTimer);
+        signal.removeEventListener('abort', onAbort);
       };
       const fail = (error: AppError) => {
         if (settled) return;
@@ -306,9 +358,16 @@ export class SessionManager {
         s.abort.abort();
         reject(error);
       };
+      const onAbort = () => fail({ code: 'aborted', message: 'cancelled' });
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
 
-      llm
-        .generate(
+      // Include synchronous provider throws in the same cleanup path as a
+      // rejected promise. Neither kind of failure may leave timeout handles.
+      Promise.resolve().then(() => settled ? '' : llm.generate(
           transcript,
           (delta) => {
             if (!gotFirstToken) {
@@ -318,7 +377,7 @@ export class SessionManager {
             if (!settled && this.active?.id === s.id) this.deps.events.onLlmDelta(s.id, delta);
           },
           signal,
-        )
+        ))
         .then((full) => {
           if (settled) return;
           settled = true;

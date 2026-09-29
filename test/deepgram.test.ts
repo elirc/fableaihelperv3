@@ -108,6 +108,66 @@ describe('parseDeepgramFrame', () => {
   });
 });
 
+// The frame parser sits directly on the network: every byte Deepgram (or a
+// proxy in between) sends lands here first. These pin that no shape it can
+// produce — or that a hostile intermediary could inject — reaches typed code.
+describe('parseDeepgramFrame hostile inputs', () => {
+  test('an empty alternatives array yields no frame', () => {
+    // `alternatives[0]` is undefined; optional chaining must absorb it rather
+    // than hand `undefined.transcript` a TypeError inside the message handler.
+    expect(parseDeepgramFrame(JSON.stringify({ type: 'Results', channel: { alternatives: [] } }))).toBeNull();
+  });
+
+  test('a missing channel or a null channel yields no frame', () => {
+    expect(parseDeepgramFrame(JSON.stringify({ type: 'Results' }))).toBeNull();
+    expect(parseDeepgramFrame(JSON.stringify({ type: 'Results', channel: null }))).toBeNull();
+    expect(parseDeepgramFrame(JSON.stringify({ type: 'Results', channel: 'nope' }))).toBeNull();
+  });
+
+  test('a non-string transcript yields no frame', () => {
+    // The transcript is pushed into strings the whole pipeline concatenates; a
+    // number or object leaking through would corrupt the joined transcript.
+    for (const transcript of [42, null, ['a'], { text: 'a' }]) {
+      expect(
+        parseDeepgramFrame(JSON.stringify({ type: 'Results', channel: { alternatives: [{ transcript }] } })),
+      ).toBeNull();
+    }
+  });
+
+  test('is_final must be literally true — truthy imposters read as interim', () => {
+    // A final wrongly promoted commits revisable text into the committed
+    // prefix; treating imposters as interim is the safe direction.
+    for (const is_final of ['true', 1, {}, []]) {
+      expect(
+        parseDeepgramFrame(
+          JSON.stringify({ type: 'Results', is_final, channel: { alternatives: [{ transcript: 'hi' }] } }),
+        ),
+      ).toEqual({ kind: 'transcript', transcript: 'hi', isFinal: false });
+    }
+  });
+
+  test('scalar and array JSON payloads are ignored without throwing', () => {
+    for (const raw of ['null', '42', '"Results"', '[]', 'true']) {
+      expect(parseDeepgramFrame(raw)).toBeNull();
+    }
+  });
+
+  test('a pathologically nested payload cannot crash the message handler', () => {
+    // Deep nesting can blow the JSON.parse stack (a catchable RangeError); the
+    // parser must swallow it like any other malformed frame. A huge but flat
+    // transcript, by contrast, is legitimate and must survive.
+    const deep = '['.repeat(200_000) + ']'.repeat(200_000);
+    expect(() => parseDeepgramFrame(deep)).not.toThrow();
+    expect(parseDeepgramFrame(deep)).toBeNull();
+
+    const huge = 'word '.repeat(200_000).trim();
+    const frame = parseDeepgramFrame(
+      JSON.stringify({ type: 'Results', is_final: true, channel: { alternatives: [{ transcript: huge }] } }),
+    );
+    expect(frame).toEqual({ kind: 'transcript', transcript: huge, isFinal: true });
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Fake WebSocket. The tests drive open/message/error/close by hand; close()
 // deliberately does not fire onclose, because a dead server never answers —
@@ -462,8 +522,9 @@ describe('DeepgramStream.onError', () => {
     stream.onError((e) => errors.push(e));
 
     const done = stream.finalize(5_000);
+    const rejected = expect(done).rejects.toMatchObject({ code: 'stt_timeout' });
     await vi.advanceTimersByTimeAsync(5_000); // server never closed; timeout tore down
-    await done;
+    await rejected;
 
     ws.emitSocketError();
     expect(errors).toEqual([]);
@@ -588,6 +649,44 @@ describe('DeepgramStream audio', () => {
 });
 
 describe('DeepgramStream.finalize', () => {
+  test('an abnormal close rejects with server details and no duplicate callback', async () => {
+    const { stream, ws } = await connected();
+    const errors: AppError[] = [];
+    const partials: string[] = [];
+    stream.onError((error) => errors.push(error));
+    stream.onPartial((value) => partials.push(value));
+    ws.emitMessage(results('received so far', true));
+    const done = stream.finalize(5_000);
+    ws.emitClose(1011, 'NET-0001');
+    await expect(done).rejects.toMatchObject({ code: 'stt_error', message: expect.stringContaining('NET-0001') });
+    ws.emitSocketError();
+    ws.emitMessage(results('late text', true));
+    expect(errors).toEqual([]);
+    expect(partials).toEqual(['received so far']);
+  });
+
+  test('finalize consumes a queued error without replaying it to a later callback', async () => {
+    const { stream, ws } = await connected();
+    ws.emitSocketError();
+    await expect(stream.finalize(5_000)).rejects.toMatchObject({ code: 'stt_error' });
+    const errors: AppError[] = [];
+    stream.onError((error) => errors.push(error));
+    expect(errors).toEqual([]);
+  });
+
+  test('a provider error during finalize rejects once and ignores post-abort events', async () => {
+    const { stream, ws } = await connected();
+    const errors: AppError[] = [];
+    stream.onError((error) => errors.push(error));
+    const done = stream.finalize(5_000);
+    ws.emitMessage(JSON.stringify({ type: 'Error', description: 'flush failed' }));
+    await expect(done).rejects.toMatchObject({ code: 'stt_error', message: expect.stringContaining('flush failed') });
+    stream.abort();
+    ws.emitSocketError();
+    ws.emitClose(1011, 'late close');
+    expect(errors).toEqual([]);
+  });
+
   test('sends CloseStream and resolves with the full transcript once the server closes', async () => {
     const { stream, ws } = await connected();
     ws.emitMessage(results('What is your greatest weakness?', true));
@@ -663,13 +762,13 @@ describe('DeepgramStream.finalize', () => {
 
   // Waiting on a socket that is not open would burn the entire timeout budget
   // (straight onto stop-to-first-word) before returning this same string.
-  test('resolves at once when the socket is not open, without burning the timeout', async () => {
+  test('rejects at once when the socket is not open, without burning the timeout', async () => {
     vi.useFakeTimers();
     const { stream, ws } = await connected();
     ws.emitMessage(results('caught before the drop', true));
     (stream as unknown as { open: boolean }).open = false; // the socket regressed under us
 
-    await expect(stream.finalize(5_000)).resolves.toBe('caught before the drop');
+    await expect(stream.finalize(5_000)).rejects.toMatchObject({ code: 'stt_error' });
     expect(ws.closeCalls).toBeGreaterThan(0); // the dead socket is released
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -685,13 +784,15 @@ describe('DeepgramStream.finalize', () => {
     ws.emitMessage(results('heard', true));
 
     const done = stream.finalize(5_000);
+    const rejected = expect(done).rejects.toMatchObject({ code: 'stt_timeout' });
     await vi.advanceTimersByTimeAsync(5_000);
-    await expect(done).resolves.toBe('heard');
+    await rejected;
+    expect(seen).toEqual(['heard']);
 
     seen.length = 0;
     ws.emitMessage(results('heard plus a late tail', true));
     expect(seen).toEqual([]);
-    await expect(stream.finalize(5_000)).resolves.toBe('heard'); // the answer did not shift
+    await expect(stream.finalize(5_000)).rejects.toMatchObject({ code: 'stt_timeout' });
   });
 
   test('an empty final leaves no gap in the joined transcript', async () => {
@@ -726,29 +827,32 @@ describe('DeepgramStream.finalize', () => {
     expect(errors).toEqual([]);
   });
 
-  test('settles within the timeout when the server never closes', async () => {
+  test('rejects with stt_timeout when the server never closes', async () => {
     vi.useFakeTimers();
     const { stream, ws } = await connected();
     ws.emitMessage(results('half a sentence', true));
 
     const done = stream.finalize(5_000);
+    const rejected = expect(done).rejects.toMatchObject({ code: 'stt_timeout' });
     await vi.advanceTimersByTimeAsync(5_000);
 
-    await expect(done).resolves.toBe('half a sentence');
+    await rejected;
     expect(ws.closeCalls).toBeGreaterThan(0);
     expect(vi.getTimerCount()).toBe(0); // keepalive and finalize timers both cleared
   });
 
   // Waiting on a socket we already know is dead burned the entire 5 s finalize
   // budget — straight onto stop-to-first-word — to return this same string.
-  test('returns at once when the CloseStream send throws', async () => {
+  test('rejects at once with the cause when the CloseStream send throws', async () => {
     vi.useFakeTimers();
     const { stream, ws } = await connected();
     ws.emitMessage(results('what we caught', true));
     ws.sendError = new Error('socket already gone');
 
     // No timer advance at all: finalize must settle on its own.
-    await expect(stream.finalize(5_000)).resolves.toBe('what we caught');
+    await expect(stream.finalize(5_000)).rejects.toMatchObject({
+      code: 'stt_error', message: expect.stringContaining('socket already gone'),
+    });
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -764,25 +868,25 @@ describe('DeepgramStream.finalize', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  test('returns the best transcript available after a mid-stream error', async () => {
+  test('rejects after a mid-stream error rather than treating a partial transcript as complete', async () => {
     vi.useFakeTimers();
     const { stream, ws } = await connected();
     stream.onError(() => {});
     ws.emitMessage(results('got this far', true));
     ws.emitSocketError();
 
-    await expect(stream.finalize(5_000)).resolves.toBe('got this far');
+    await expect(stream.finalize(5_000)).rejects.toMatchObject({ code: 'stt_error' });
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  test('resolves without waiting when the socket already closed', async () => {
+  test('rejects without waiting when the socket closed before finalize requested it', async () => {
     vi.useFakeTimers();
     const { stream, ws } = await connected();
     stream.onError(() => {});
     ws.emitMessage(results('all of it', true));
     ws.emitClose(1000, '');
 
-    await expect(stream.finalize(5_000)).resolves.toBe('all of it');
+    await expect(stream.finalize(5_000)).rejects.toMatchObject({ code: 'stt_error' });
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -858,7 +962,7 @@ describe('DeepgramStream keepalive', () => {
   // The user pressed Stop and the flush is in progress: a keepalive tick
   // discovering the dying socket must not toast a "lost connection" error for
   // a stop that is actually succeeding — finalize returns what was heard.
-  test('a socket dying during the close wait does not surface a spurious error', async () => {
+  test('a close wait timeout rejects once without a duplicate callback or keepalive error', async () => {
     vi.useFakeTimers();
     const { stream, ws } = await connected();
     const errors: AppError[] = [];
@@ -866,10 +970,11 @@ describe('DeepgramStream keepalive', () => {
     ws.emitMessage(results('kept', true));
 
     const done = stream.finalize(20_000);
+    const rejected = expect(done).rejects.toMatchObject({ code: 'stt_timeout' });
     ws.sendError = new Error('socket is CLOSING');
     await vi.advanceTimersByTimeAsync(20_000); // crosses the 8 s keepalive tick, then times out
 
-    await expect(done).resolves.toBe('kept');
+    await rejected;
     expect(errors).toEqual([]);
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -886,5 +991,102 @@ describe('DeepgramStream keepalive', () => {
     expect(errors).toHaveLength(1);
     expect(errors[0]?.code).toBe('stt_error');
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test('a mid-recording send failure stops the keepalive — one error total, no timer left', async () => {
+    vi.useFakeTimers();
+    const { stream, ws } = await connected();
+    const errors: AppError[] = [];
+    stream.onError((e) => errors.push(e));
+
+    ws.sendError = new Error('socket hung up');
+    stream.sendAudio(pcm(64));
+    expect(errors).toHaveLength(1);
+
+    // The keepalive was live when the audio send died; its next ticks against
+    // the same dead socket must not re-report the death every 8 seconds.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(errors).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test('a pre-open flush that dies reports once and never starts the keepalive', async () => {
+    vi.useFakeTimers();
+    const { stream, ws } = await connected();
+    const errors: AppError[] = [];
+    stream.onError((e) => errors.push(e));
+    const internals = stream as unknown as { open: boolean; handleOpen: () => void };
+    internals.open = false; // reproduce the CONNECTING window
+    stream.sendAudio(pcm(4));
+    stream.sendAudio(pcm(8));
+    stream.sendAudio(pcm(12));
+
+    ws.sent = [];
+    ws.sendError = new Error('dead before the flush');
+    internals.handleOpen();
+
+    // One failure, the rest of the queue abandoned (the stream is already
+    // torn down), and no keepalive interval left running on the corpse.
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.code).toBe('stt_error');
+    expect(ws.audioFrames()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(errors).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+// fullTranscript() runs on every message and now reports from a pre-joined
+// committed prefix instead of re-joining every final segment per interim.
+// These pin that the cache can never drift from what a full re-join would say.
+describe('DeepgramStream committed-transcript caching', () => {
+  test('hundreds of interim revisions all report against the same committed prefix', async () => {
+    const { stream, ws } = await connected();
+    const seen: string[] = [];
+    stream.onPartial((t) => seen.push(t));
+
+    ws.emitMessage(results('what is your', true));
+    // A long answer generates hundreds of interim revisions; each must combine
+    // the committed prefix with ONLY the newest interim, never a stale one.
+    for (let i = 0; i < 300; i++) ws.emitMessage(results(`greatest v${i}`, false));
+    expect(seen.at(-1)).toBe('what is your greatest v299');
+
+    ws.emitMessage(results('greatest weakness?', true));
+    const done = stream.finalize(5_000);
+    ws.emitClose(1000, '');
+    await expect(done).resolves.toBe('what is your greatest weakness?');
+  });
+
+  test('finals interleaved with interims extend the prefix in order', async () => {
+    const { stream, ws } = await connected();
+    const seen: string[] = [];
+    stream.onPartial((t) => seen.push(t));
+
+    ws.emitMessage(results('alpha', true));
+    ws.emitMessage(results('bet', false));
+    ws.emitMessage(results('beta', true)); // the final replaces the interim, not appends after it
+    ws.emitMessage(results('gam', false));
+
+    // Any cache-invalidation bug shows up as a duplicated or missing segment
+    // in one of these four snapshots.
+    expect(seen).toEqual(['alpha', 'alpha bet', 'alpha beta', 'alpha beta gam']);
+
+    const done = stream.finalize(5_000);
+    ws.emitClose(1000, '');
+    await expect(done).resolves.toBe('alpha beta gam');
+  });
+
+  test('a whitespace-only final joins byte-identically to the old array join', async () => {
+    const { stream, ws } = await connected();
+    ws.emitMessage(results('first', true));
+    ws.emitMessage(results('   ', true)); // truthy, so it joins — only the string edges are trimmed
+    ws.emitMessage(results('second', true));
+
+    const done = stream.finalize(5_000);
+    ws.emitClose(1000, '');
+    // 'first' + ' ' + '   ' + ' ' + 'second': interior whitespace is preserved
+    // exactly as [...finals].join(' ') produced it — the cache must not
+    // normalize what the old code passed through.
+    await expect(done).resolves.toBe('first' + ' '.repeat(5) + 'second');
   });
 });

@@ -175,4 +175,63 @@ describe('end-to-end chunking', () => {
     const body = dataLine('café — ☕') + 'data: [DONE]\n\n';
     expect(drain(body, 3)).toEqual(['café — ☕']);
   });
+
+  test('cutting the stream at every byte boundary yields identical deltas', () => {
+    // A network read can end anywhere: inside "data:", mid-JSON, between \r
+    // and \n, inside [DONE]. Exhaustively cutting one realistic body at every
+    // index proves the deltas/rest contract has no position-dependent hole.
+    const body =
+      ': keep-alive\n' + dataLine('Hello, ') + '\n' + dataLine('world').replace('\n', '\r\n') + 'data: [DONE]\n\n';
+    const expected = ['Hello, ', 'world'];
+    for (let cut = 0; cut <= body.length; cut++) {
+      const first = parseSSEChunk(body.slice(0, cut));
+      const second = parseSSEChunk(first.rest + body.slice(cut));
+      const tail = parseSSETail(second.rest);
+      expect([...first.deltas, ...second.deltas, ...tail]).toEqual(expected);
+    }
+  });
+});
+
+describe('parseSSEChunk buffer bookkeeping', () => {
+  test('[DONE] mid-buffer skips only itself — later lines in the same chunk still parse', () => {
+    // [DONE] is a sentinel to ignore, not a terminator: the read loop ends when
+    // the stream closes. Treating it as end-of-parse would drop any bytes an
+    // unusual server (or a coalescing proxy) packed after it.
+    const { deltas, rest } = parseSSEChunk(dataLine('a') + 'data: [DONE]\n' + dataLine('b'));
+    expect(deltas).toEqual(['a', 'b']);
+    expect(rest).toBe('');
+  });
+
+  test('an all-CRLF stream with comments interleaved between events parses like LF', () => {
+    const crlf = (s: string) => s.replace(/\n/g, '\r\n');
+    const body = crlf(': ka\n' + dataLine('a') + '\n' + ': ka\n' + dataLine('b') + 'data: [DONE]\n\n');
+    const { deltas, rest } = parseSSEChunk(body);
+    expect(deltas).toEqual(['a', 'b']);
+    expect(rest).toBe('');
+  });
+
+  test('a data line with an empty or whitespace payload is ignored, not parsed', () => {
+    // JSON.parse('') throws; these lines must burn in the try/catch without
+    // taking the surrounding chunk's real deltas with them.
+    expect(() => parseSSEChunk('data:\n' + 'data:   \n' + dataLine('ok'))).not.toThrow();
+    expect(parseSSEChunk('data:\n' + 'data:   \n' + dataLine('ok')).deltas).toEqual(['ok']);
+  });
+
+  test('rest is byte-exact: empty after a clean newline, the partial line otherwise', () => {
+    // The caller carries `rest` forward verbatim and prepends the next chunk;
+    // a single byte lost or duplicated here corrupts the reassembled line.
+    expect(parseSSEChunk(dataLine('x')).rest).toBe('');
+    const partial = 'data: {"choices":[{"delta":{"cont';
+    expect(parseSSEChunk(dataLine('x') + partial).rest).toBe(partial);
+    expect(parseSSEChunk(partial).rest).toBe(partial); // no newline at all: everything carries forward
+  });
+});
+
+describe('parseSSETail line endings', () => {
+  test('recovers a final line terminated by a bare CR', () => {
+    // A CRLF stream truncated between the \r and the \n leaves the \r in the
+    // tail; the flush must still strip it and recover the delta.
+    const line = 'data: ' + JSON.stringify({ choices: [{ delta: { content: 'end' } }] }) + '\r';
+    expect(parseSSETail(line)).toEqual(['end']);
+  });
 });

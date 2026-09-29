@@ -6,6 +6,56 @@ export type LlmProviderId = 'anthropic' | 'groq';
 /** How long an answer should be. Feeds the system prompt; does not change the cached prefix shape. */
 export type AnswerStyle = 'brief' | 'balanced' | 'detailed';
 
+export type Situation = 'interview' | 'technical' | 'client' | 'meeting' | 'custom';
+
+export interface OutputPreferences {
+  answerStyle: AnswerStyle;
+  format: 'spoken' | 'talking-points' | 'star';
+  tone: 'conversational' | 'confident' | 'diplomatic';
+  audience: 'general' | 'technical' | 'nontechnical';
+}
+
+export interface ScenarioProfile {
+  id: string;
+  name: string;
+  situation: Situation;
+  background: string;
+  instructions: string;
+  includeResume: boolean;
+  includeJobDescription: boolean;
+  output: Partial<OutputPreferences>;
+}
+
+/** An explicitly selected, generated suggestion, not a record of what the user said. */
+export interface RelatedAnswer {
+  question: string;
+  answer: string;
+}
+
+/** Resolved at submission; no credentials and no mutable references to settings. */
+export interface ContextSnapshot {
+  profileId: string;
+  profileName: string;
+  situation: Situation;
+  background: string;
+  instructions: string;
+  resume: string;
+  jobDescription: string;
+  output: OutputPreferences;
+  questionNote: string;
+  relatedAnswer?: RelatedAnswer;
+  refinement?: string;
+}
+
+export interface AnswerOptions {
+  profileId?: string;
+  overrides?: Partial<OutputPreferences>;
+  questionNote?: string;
+  snapshot?: ContextSnapshot;
+  followUp?: RelatedAnswer;
+  refinement?: string;
+}
+
 /** Default global shortcut that toggles recording while the call app has focus. */
 export const DEFAULT_HOTKEY = 'CommandOrControl+Shift+Space';
 
@@ -23,6 +73,11 @@ export interface SettingsView {
   hasDeepgramKey: boolean;
   hasAnthropicKey: boolean;
   hasGroqKey: boolean;
+  /** Optional at the bridge for compatibility; upgraded stores populate these fields. */
+  contextProfiles?: ScenarioProfile[];
+  activeProfileId?: string;
+  outputDefaults?: OutputPreferences;
+  keyStorage?: 'encrypted' | 'plaintext' | 'mixed' | 'none';
 }
 
 /** Settings patch sent from the renderer. Key fields are write-only: an empty string clears a key, undefined leaves it untouched. */
@@ -36,6 +91,9 @@ export interface SettingsPatch {
   deepgramKey?: string;
   anthropicKey?: string;
   groqKey?: string;
+  contextProfiles?: ScenarioProfile[];
+  activeProfileId?: string;
+  outputDefaults?: OutputPreferences;
 }
 
 export type ErrorCode =
@@ -64,7 +122,7 @@ export type Result<T> = { ok: true; value: T } | { ok: false; error: AppError };
 export interface AnswerMetrics {
   /** Stop pressed → final transcript in hand. */
   sttFinalizeMs: number;
-  /** Stop pressed → first answer token rendered. The number this app exists to keep small. */
+  /** Stop pressed → first answer token received in main; excludes IPC and rendering. */
   firstTokenMs: number;
   /** Stop pressed → answer complete. */
   totalMs: number;
@@ -88,6 +146,7 @@ export interface LlmDoneEvent {
   transcript: string;
   answer: string;
   metrics: AnswerMetrics;
+  context?: ContextSnapshot;
 }
 
 export interface SessionErrorEvent {
@@ -99,14 +158,14 @@ export interface SessionErrorEvent {
 export interface RendererApi {
   getSettings(): Promise<SettingsView>;
   saveSettings(patch: SettingsPatch): Promise<SettingsView>;
-  startSession(): Promise<Result<number>>;
+  startSession(options?: AnswerOptions): Promise<Result<number>>;
   /**
    * Ask a question directly (typed, or a re-ask of an earlier transcript)
    * without recording. Returns a session id; the answer then arrives through
    * the same event stream as a recorded session: one final stt:partial
    * carrying the question text, llm:delta per token, llm:done / session:error.
    */
-  askQuestion(text: string): Promise<Result<number>>;
+  askQuestion(text: string, options?: AnswerOptions): Promise<Result<number>>;
   sendAudio(sessionId: number, pcm: ArrayBuffer): void;
   stopSession(sessionId: number): Promise<Result<null>>;
   cancelSession(sessionId: number): Promise<void>;

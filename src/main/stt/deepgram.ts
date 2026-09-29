@@ -98,20 +98,29 @@ function closeDetail(ev?: { code?: number; reason?: string }): string {
 
 export class DeepgramStream implements SttStream {
   private ws: WebSocket;
-  private finals: string[] = [];
+  /**
+   * Every finalized segment, pre-joined with single spaces. Kept as one string
+   * rather than an array because fullTranscript() runs on EVERY message —
+   * interims arrive several times a second — and re-joining all segments each
+   * time is O(recording length) per message, O(n²) over a long recording.
+   * Appending here on each final keeps the per-message work O(interim).
+   */
+  private committed = '';
   private interim = '';
   private partialCb: ((text: string, isFinal: boolean) => void) | null = null;
   private errorCb: ((error: AppError) => void) | null = null;
   /** An error raised before the session registered onError; delivered on registration. */
   private queuedError: AppError | null = null;
   private errorSent = false;
+  private terminalError: AppError | null = null;
+  private finalizationStarted = false;
   private pending: ArrayBuffer[] = [];
   private pendingBytes = 0;
   private open = false;
   private everOpen = false;
   private closed = false;
   private aborted = false;
-  /** True once we asked for the close (finalize/abort/error), so onclose isn't reported as a new failure. */
+  /** True once we asked to close; only a normal server close is expected during finalize. */
   private closeRequested = false;
   private keepalive: ReturnType<typeof setInterval> | null = null;
   private closeWaiters: (() => void)[] = [];
@@ -231,7 +240,11 @@ export class DeepgramStream implements SttStream {
   }
 
   private async runFinalize(timeoutMs: number): Promise<string> {
-    // Already closed, aborted, or failed: nothing left to flush.
+    this.finalizationStarted = true;
+    // finalize owns error delivery once called; do not replay a queued error
+    // through onError as well as rejecting this promise.
+    this.queuedError = null;
+    if (this.terminalError) throw this.terminalError;
     if (this.closed) return this.fullTranscript();
     this.closeRequested = true;
     // Stop pinging the moment we ask for the close: a KeepAlive after
@@ -240,22 +253,20 @@ export class DeepgramStream implements SttStream {
     // surface a spurious "lost connection" error mid-stop.
     this.stopKeepalive();
 
-    // Never reached OPEN, or the socket is already gone: there is nothing to
-    // flush and nobody to answer, so waiting would just burn the whole timeout
-    // budget before returning this same transcript.
+    // A missing connection cannot confirm the transcript tail. Fail promptly
+    // rather than waiting out the budget or claiming the partial is complete.
     if (!this.open) {
-      this.teardown();
-      this.closeSocket();
-      return this.fullTranscript();
+      this.emitError('The connection to Deepgram was lost before the final transcript could be received.');
+      throw this.terminalError;
     }
     try {
       this.ws.send(JSON.stringify({ type: 'CloseStream' }));
-    } catch {
-      this.teardown();
-      this.closeSocket();
-      return this.fullTranscript();
+    } catch (err) {
+      this.emitError(`Could not request the final transcript from Deepgram${reason(err)}`);
+      throw this.terminalError;
     }
     await this.waitForClose(timeoutMs);
+    if (this.terminalError) throw this.terminalError;
     return this.fullTranscript();
   }
 
@@ -282,10 +293,10 @@ export class DeepgramStream implements SttStream {
   private handleMessage(ev: MessageEvent): void {
     // After teardown the transcript is spoken for — finalize() has already
     // resolved with it (or the stream died and reported why). A late frame
-    // must not fire partials or grow the finals past what was returned, or the
-    // on-screen transcript would contradict the answer generated from it.
-    // Note this is `closed`, not `closeRequested`: the tail flush between
-    // CloseStream and the server close must still count.
+    // must not fire partials or grow the committed text past what was
+    // returned, or the on-screen transcript would contradict the answer
+    // generated from it. Note this is `closed`, not `closeRequested`: the tail
+    // flush between CloseStream and the server close must still count.
     if (this.closed) return;
     if (typeof ev.data !== 'string') return;
     const frame = parseDeepgramFrame(ev.data);
@@ -295,7 +306,9 @@ export class DeepgramStream implements SttStream {
       return;
     }
     if (frame.isFinal) {
-      if (frame.transcript) this.finals.push(frame.transcript);
+      if (frame.transcript) {
+        this.committed = this.committed ? this.committed + ' ' + frame.transcript : frame.transcript;
+      }
       this.interim = '';
     } else {
       this.interim = frame.transcript;
@@ -316,22 +329,27 @@ export class DeepgramStream implements SttStream {
   private handleClose(ev?: { code?: number; reason?: string }): void {
     // A close we didn't ask for means the transcript is truncated — say so
     // instead of quietly handing back whatever we happened to catch.
-    const unexpected = this.everOpen && !this.closeRequested;
+    if (this.closed) return;
+    const unexpected = this.everOpen && (!this.closeRequested || ev?.code !== 1000);
     const detail = closeDetail(ev);
-    this.teardown();
     if (unexpected) {
-      this.emitError(`Deepgram closed the connection mid-recording${detail ? ` (${detail})` : ''}.`);
-    }
+      const stage = this.finalizationStarted ? 'before the final transcript was received' : 'mid-recording';
+      this.emitError(`Deepgram closed the connection ${stage}${detail ? ` (${detail})` : ''}.`);
+    } else this.teardown();
   }
 
-  private emitError(message: string): void {
+  private emitError(message: string, code: AppError['code'] = 'stt_error'): void {
     // At most one error per stream, and never after abort().
     if (this.aborted || this.errorSent) return;
     this.errorSent = true;
+    const error: AppError = { code, message };
+    this.terminalError = error;
     this.closeRequested = true;
     this.teardown();
     this.closeSocket();
-    const error: AppError = { code: 'stt_error', message };
+    // The waiting finalize promise reports its own failure. Sending onError
+    // too would give callers two terminal notifications for one failure.
+    if (this.finalizationStarted) return;
     const cb = this.errorCb;
     // The session registers onError only after connect() resolves, so a failure
     // during the pre-open flush would otherwise be dropped on the floor.
@@ -388,9 +406,10 @@ export class DeepgramStream implements SttStream {
         resolve();
       };
       const timer = setTimeout(() => {
-        // Server did not close in time — take what we have and drop the socket.
-        this.teardown();
-        this.closeSocket();
+        this.emitError(
+          'Deepgram did not finish transcribing in time. The transcript received so far is still available; review it before retrying.',
+          'stt_timeout',
+        );
         finish();
       }, timeoutMs);
       this.closeWaiters.push(finish);
@@ -398,7 +417,14 @@ export class DeepgramStream implements SttStream {
   }
 
   private fullTranscript(): string {
-    return [...this.finals, this.interim].filter(Boolean).join(' ').trim();
+    // The trim stays per-call (not baked into `committed`) so a whitespace-only
+    // interim or edge segment renders exactly as the old join-then-trim did.
+    const joined = this.interim
+      ? this.committed
+        ? this.committed + ' ' + this.interim
+        : this.interim
+      : this.committed;
+    return joined.trim();
   }
 }
 

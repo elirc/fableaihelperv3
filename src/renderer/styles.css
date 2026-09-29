@@ -155,7 +155,8 @@ main, #settingsView {
   min-height: 74px;
   flex: none;
 }
-.panel.grow { flex: 1; min-height: 130px; }
+.panel.grow { flex: 1 0 auto; min-height: 185px; }
+#answerBox { min-height: 90px; }
 
 .panel-title {
   display: flex; align-items: center; gap: 8px;
@@ -333,3 +334,32 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .row button:hover { filter: brightness(1.1); }
 
 .saved { color: var(--green); text-align: center; font-size: 13px; }
+
+/* Context stays compact until opened; every control remains reachable at 380px. */
+.context-panel { flex: none; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+summary { cursor: pointer; font-size: 12px; line-height: 1.5; }
+#contextSummary { display: inline-block; max-width: 48%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+.context-fields { display: flex; flex-direction: column; gap: 8px; padding-top: 10px; }
+.context-fields label { font-size: 12px; }
+.context-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.context-grid select { margin-top: 4px; }
+.context-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.context-actions button, #cancelFollowup, #cancelEditQuestion { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 11px; cursor: pointer; }
+.context-actions button:hover { border-color: var(--muted); }
+.context-actions select { width: auto; max-width: 150px; padding: 4px; }
+.context-actions button:disabled { opacity: .5; cursor: default; }
+.answer-actions { padding: 8px 12px; border-top: 1px solid var(--border); flex: none; }
+.answer-actions > .context-actions { padding-top: 8px; }
+.entry-context { padding: 5px 12px; }
+.entry-context pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 11px; color: var(--muted); max-height: 160px; overflow-y: auto; }
+.ask-row input, .ask-row select { min-width: 0; }
+.panel-title { flex-wrap: wrap; }
+#questionNote { flex: none; min-height: 34px; }
+@media (max-height: 620px) {
+  main { gap: 6px; padding: 8px 12px; }
+  .record-btn { padding: 8px; }
+  .panel:not(.grow) { min-height: 50px; }
+  #questionNote { min-height: 30px; padding: 5px 8px; }
+  label[for="questionNote"] { font-size: 11px; line-height: 1.1; }
+  .context-panel { padding: 6px 8px; }
+}

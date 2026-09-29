@@ -8,7 +8,12 @@ import {
   type LlmProviderId,
   type SettingsPatch,
   type SettingsView,
+  type ScenarioProfile,
+  type OutputPreferences,
 } from '../shared/types';
+import { createDefaultProfile, createProfile, DEFAULT_OUTPUT } from '../shared/context';
+import { contextProfilesSchema, outputPreferencesSchema, scenarioProfileSchema } from './context-schema';
+import type { WindowBounds } from './bounds';
 
 // JSON settings store in %APPDATA%/AI Call Assistant/settings.json.
 // Plain fields are stored as-is; API keys are encrypted with Electron
@@ -23,7 +28,12 @@ interface StoreShape {
   answerStyle: AnswerStyle;
   /** Electron accelerator; empty string means "no global shortcut". */
   hotkey: string;
+  contextProfiles: ScenarioProfile[];
+  activeProfileId: string;
+  outputDefaults: OutputPreferences;
   secrets: { deepgramKey?: string; anthropicKey?: string; groqKey?: string };
+  /** Last window geometry, saved on close. Never exposed to the renderer. */
+  windowBounds?: WindowBounds;
 }
 
 // A factory, not a shared constant. The previous module-level DEFAULTS object
@@ -37,6 +47,9 @@ function freshDefaults(): StoreShape {
     llmProvider: 'anthropic',
     answerStyle: 'balanced',
     hotkey: DEFAULT_HOTKEY,
+    contextProfiles: [createDefaultProfile()],
+    activeProfileId: 'interview',
+    outputDefaults: { ...DEFAULT_OUTPUT },
     secrets: {},
   };
 }
@@ -51,6 +64,9 @@ const persistedSchema = z.object({
   llmProvider: z.enum(['anthropic', 'groq']).catch('anthropic'),
   answerStyle: z.enum(['brief', 'balanced', 'detailed']).catch('balanced'),
   hotkey: z.string().catch(DEFAULT_HOTKEY),
+  contextProfiles: z.unknown().optional(),
+  activeProfileId: z.unknown().optional(),
+  outputDefaults: z.unknown().optional(),
   secrets: z
     .object({
       deepgramKey: z.string().optional().catch(undefined),
@@ -58,6 +74,15 @@ const persistedSchema = z.object({
       groqKey: z.string().optional().catch(undefined),
     })
     .catch(() => ({})),
+  windowBounds: z
+    .object({
+      x: z.number().int(),
+      y: z.number().int(),
+      width: z.number().int().positive(),
+      height: z.number().int().positive(),
+    })
+    .optional()
+    .catch(undefined),
 });
 
 let cache: StoreShape | null = null;
@@ -71,6 +96,56 @@ function filePath(): string {
   return path.join(app.getPath('userData'), 'settings.json');
 }
 
+function object(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : {};
+}
+
+/** Recover individual output fields so one bad preference cannot erase its siblings. */
+function recoverOutput(raw: unknown): Partial<OutputPreferences> {
+  const input = object(raw);
+  const result: Partial<OutputPreferences> = {};
+  for (const key of Object.keys(outputPreferencesSchema.shape) as (keyof OutputPreferences)[]) {
+    const parsed = outputPreferencesSchema.shape[key].safeParse(input[key]);
+    if (parsed.success) Object.assign(result, { [key]: parsed.data });
+  }
+  return result;
+}
+
+function recoverProfiles(raw: unknown, answerStyle: AnswerStyle): ScenarioProfile[] {
+  const profiles: ScenarioProfile[] = [];
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const input = object(item);
+      const id = scenarioProfileSchema.shape.id.safeParse(input.id);
+      // IDs establish identity: malformed or duplicate identities cannot be repaired safely.
+      if (!id.success || profiles.some((profile) => profile.id === id.data)) continue;
+      const situation = scenarioProfileSchema.shape.situation.safeParse(input.situation);
+      const profile = createProfile(situation.success ? situation.data : 'custom', id.data);
+      for (const key of Object.keys(scenarioProfileSchema.shape) as (keyof ScenarioProfile)[]) {
+        if (key === 'output') continue;
+        const parsed = scenarioProfileSchema.shape[key].safeParse(input[key]);
+        if (parsed.success) Object.assign(profile, { [key]: parsed.data });
+      }
+      profile.output = recoverOutput(input.output);
+      // Enforce the same total count/size bounds used on saves while preserving
+      // valid earlier entries in an oversized or partly corrupted file.
+      if (contextProfilesSchema.safeParse([...profiles, profile]).success) profiles.push(profile);
+    }
+  }
+  return profiles.length ? profiles : [createDefaultProfile(answerStyle)];
+}
+
+function cloneStore(value: StoreShape): StoreShape {
+  return {
+    ...value,
+    secrets: { ...value.secrets },
+    contextProfiles: value.contextProfiles.map((profile) => ({ ...profile, output: { ...profile.output } })),
+    outputDefaults: { ...value.outputDefaults },
+    ...(value.windowBounds ? { windowBounds: { ...value.windowBounds } } : {}),
+  };
+}
+
 function readFromDisk(): StoreShape {
   let raw: unknown;
   try {
@@ -81,6 +156,7 @@ function readFromDisk(): StoreShape {
   const parsed = persistedSchema.safeParse(raw);
   if (!parsed.success) return freshDefaults(); // not an object at all
   const d = parsed.data;
+  const contextProfiles = recoverProfiles(d.contextProfiles, d.answerStyle);
   return {
     resume: d.resume,
     jobDescription: d.jobDescription,
@@ -88,8 +164,13 @@ function readFromDisk(): StoreShape {
     llmProvider: d.llmProvider,
     answerStyle: d.answerStyle,
     hotkey: d.hotkey,
+    contextProfiles,
+    activeProfileId: typeof d.activeProfileId === 'string' && contextProfiles.some((p) => p.id === d.activeProfileId)
+      ? d.activeProfileId : contextProfiles[0]!.id,
+    outputDefaults: { ...DEFAULT_OUTPUT, answerStyle: d.answerStyle, ...recoverOutput(d.outputDefaults) },
     // Copy: the cache must never share a reference with anything it did not build.
     secrets: { ...d.secrets },
+    ...(d.windowBounds ? { windowBounds: { ...d.windowBounds } } : {}),
   };
 }
 
@@ -122,10 +203,14 @@ function decryptKey(stored: string | undefined): string {
   if (!stored) return '';
   try {
     if (stored.startsWith('enc:')) {
-      return safeStorage.decryptString(Buffer.from(stored.slice(4), 'base64'));
+      return usableKey(safeStorage.decryptString(Buffer.from(stored.slice(4), 'base64')));
     }
     if (stored.startsWith('plain:')) {
-      return Buffer.from(stored.slice(6), 'base64').toString('utf8');
+      const encoded = stored.slice(6);
+      // Buffer silently ignores invalid base64 characters; corrupted storage
+      // must not masquerade as an authentic, usable credential.
+      if (!encoded || Buffer.from(encoded, 'base64').toString('base64') !== encoded) return '';
+      return usableKey(Buffer.from(encoded, 'base64').toString('utf8'));
     }
   } catch {
     // Undecryptable (e.g. copied from another machine) — treat as unset.
@@ -133,8 +218,16 @@ function decryptKey(stored: string | undefined): string {
   return '';
 }
 
+function usableKey(value: string): string {
+  const trimmed = value.trim();
+  return trimmed && !/[\u0000-\u001f\u007f\ufffd]/u.test(trimmed) ? trimmed : '';
+}
+
 export function getSettingsView(): SettingsView {
   const s = load();
+  const keys = Object.entries(s.secrets).filter(([, value]) => decryptKey(value));
+  const encrypted = keys.some(([, value]) => value?.startsWith('enc:'));
+  const plaintext = keys.some(([, value]) => value?.startsWith('plain:'));
   return {
     resume: s.resume,
     jobDescription: s.jobDescription,
@@ -143,9 +236,13 @@ export function getSettingsView(): SettingsView {
     answerStyle: s.answerStyle,
     hotkey: s.hotkey,
     hotkeyRegistered,
-    hasDeepgramKey: !!s.secrets.deepgramKey,
-    hasAnthropicKey: !!s.secrets.anthropicKey,
-    hasGroqKey: !!s.secrets.groqKey,
+    contextProfiles: s.contextProfiles.map((profile) => ({ ...profile, output: { ...profile.output } })),
+    activeProfileId: s.activeProfileId,
+    outputDefaults: { ...s.outputDefaults },
+    keyStorage: encrypted && plaintext ? 'mixed' : encrypted ? 'encrypted' : plaintext ? 'plaintext' : 'none',
+    hasDeepgramKey: !!decryptKey(s.secrets.deepgramKey),
+    hasAnthropicKey: !!decryptKey(s.secrets.anthropicKey),
+    hasGroqKey: !!decryptKey(s.secrets.groqKey),
   };
 }
 
@@ -154,12 +251,25 @@ export function applySettingsPatch(patch: SettingsPatch): SettingsView {
   // Work on a copy and commit only after the write lands: if encryptKey or
   // persist throws (keystore hiccup, disk full), the cache still matches disk
   // instead of holding a half-applied patch the next launch silently loses.
-  const s: StoreShape = { ...cur, secrets: { ...cur.secrets } };
+  const s = cloneStore(cur);
+  if (patch.contextProfiles !== undefined) s.contextProfiles = contextProfilesSchema.parse(patch.contextProfiles);
+  if (patch.outputDefaults !== undefined) s.outputDefaults = outputPreferencesSchema.parse(patch.outputDefaults);
+  if (patch.activeProfileId !== undefined) s.activeProfileId = scenarioProfileSchema.shape.id.parse(patch.activeProfileId);
+  if (!s.contextProfiles.some((profile) => profile.id === s.activeProfileId)) {
+    throw new Error('The active context profile must exist in the saved profiles.');
+  }
   if (patch.resume !== undefined) s.resume = patch.resume;
   if (patch.jobDescription !== undefined) s.jobDescription = patch.jobDescription;
   if (patch.alwaysOnTop !== undefined) s.alwaysOnTop = patch.alwaysOnTop;
   if (patch.llmProvider !== undefined) s.llmProvider = patch.llmProvider;
-  if (patch.answerStyle !== undefined) s.answerStyle = patch.answerStyle;
+  if (patch.answerStyle !== undefined) {
+    s.answerStyle = patch.answerStyle;
+    if (patch.outputDefaults === undefined) s.outputDefaults.answerStyle = patch.answerStyle;
+    if (patch.contextProfiles === undefined) {
+      const activeProfile = s.contextProfiles.find((profile) => profile.id === s.activeProfileId);
+      if (activeProfile) activeProfile.output.answerStyle = patch.answerStyle;
+    }
+  }
   if (patch.hotkey !== undefined) s.hotkey = patch.hotkey.trim();
   for (const key of ['deepgramKey', 'anthropicKey', 'groqKey'] as const) {
     const v = patch[key];
@@ -200,6 +310,28 @@ export function getAlwaysOnTop(): boolean {
 
 export function getHotkey(): string {
   return load().hotkey;
+}
+
+/** Saved window geometry from the last run, or undefined on first run. */
+export function getWindowBounds(): WindowBounds | undefined {
+  const b = load().windowBounds;
+  return b ? { ...b } : undefined;
+}
+
+/**
+ * Persist the window geometry. Called from the window's close handler, so a
+ * write failure (disk full, file locked) is swallowed: losing the geometry is
+ * cosmetic, but an exception thrown while the app is quitting is a crash.
+ */
+export function setWindowBounds(b: WindowBounds): void {
+  const cur = load();
+  const s: StoreShape = { ...cloneStore(cur), windowBounds: { ...b } };
+  try {
+    persist(s);
+    cache = s;
+  } catch {
+    // Cosmetic data — never let it break shutdown.
+  }
 }
 
 /** Called by main.ts with the real outcome of globalShortcut.register(). */

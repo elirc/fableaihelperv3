@@ -28,19 +28,55 @@
 
     <div class="notice" id="hotkeyWarn" role="status" hidden></div>
 
-    <div class="meter-row">
+    <div class="meter-row" id="meterRow" hidden>
       <div class="meter"><div class="meter-fill" id="meterFill"></div></div>
       <div class="timer" id="timer" aria-hidden="true"></div>
     </div>
 
+    <details id="contextPanel" class="context-panel">
+      <summary>Context &amp; Instructions <span id="contextSummary" class="hint"></span></summary>
+      <div class="context-fields">
+        <p id="contextTiming" class="hint">Changes apply when you next press Record or Ask.</p>
+        <label for="profileSelect">Saved profile</label>
+        <select id="profileSelect"></select>
+        <label for="profileName">Profile name</label>
+        <input id="profileName" type="text" maxlength="80" autocomplete="off" />
+        <div class="context-actions" role="group" aria-label="Manage profiles">
+          <button id="profileNew" type="button">New</button><button id="profileDuplicate" type="button">Duplicate</button>
+          <button id="profileRename" type="button">Rename</button><button id="profileDelete" type="button">Delete</button>
+          <button id="profileSave" type="button">Save profile</button>
+        </div>
+        <p id="profileStatus" class="hint" role="status"></p>
+        <label for="scenario">Scenario</label>
+        <select id="scenario"><option value="interview">Interview</option><option value="technical">Technical Q&amp;A</option><option value="client">Client call</option><option value="meeting">Meeting</option><option value="custom">Custom</option></select>
+        <label for="contextBackground">Background</label>
+        <textarea id="contextBackground" rows="3" maxlength="16000" placeholder="Relevant facts, experience, project or meeting context"></textarea>
+        <label for="contextInstructions">Custom instructions</label>
+        <textarea id="contextInstructions" rows="3" maxlength="8000" placeholder="How should the assistant help?"></textarea>
+        <label for="instructionTemplate">Reusable instruction template</label>
+        <div class="ask-row"><select id="instructionTemplate"><option value="">Choose a template</option><option value="star">STAR example</option><option value="tradeoffs">Trade-offs and recommendation</option><option value="clarify">Clarify missing facts</option><option value="actions">Decisions and next actions</option></select><button id="applyTemplate" class="ask-btn" type="button">Add</button></div>
+        <label class="check"><input id="includeResume" type="checkbox" /> Include saved resume</label>
+        <label class="check"><input id="includeJobDescription" type="checkbox" /> Include saved job description</label>
+        <div class="context-grid">
+          <label for="answerFormat">Format<select id="answerFormat"><option value="spoken">Spoken answer</option><option value="talking-points">Talking points</option><option value="star">STAR</option></select></label>
+          <label for="answerTone">Tone<select id="answerTone"><option value="conversational">Conversational</option><option value="confident">Confident</option><option value="diplomatic">Diplomatic</option></select></label>
+        </div>
+        <label for="answerAudience">Audience</label>
+        <select id="answerAudience"><option value="general">General</option><option value="technical">Technical</option><option value="nontechnical">Nontechnical</option></select>
+      </div>
+    </details>
+    <label class="hint" for="questionNote">Note for the next question only</label>
+    <textarea id="questionNote" rows="1" maxlength="2000" placeholder="e.g. emphasize the migration project"></textarea>
+    <div id="followupBanner" class="notice" hidden><span id="followupLabel"></span> <button id="cancelFollowup" type="button">Cancel follow-up</button></div>
+    <div id="editBanner" class="notice" hidden><span id="editLabel"></span> <button id="cancelEditQuestion" type="button">Use current context</button></div>
     <form id="askForm" class="ask-row">
       <label class="sr-only" for="askInput">Type a question</label>
       <input type="text" id="askInput" placeholder="Or type the question here…" autocomplete="off" spellcheck="false" />
       <button id="askBtn" class="ask-btn" type="submit">Ask</button>
     </form>
 
-    <div class="style-row" role="group" aria-label="Answer style">
-      <span class="style-label" aria-hidden="true">Style</span>
+    <div class="style-row" role="group" aria-label="Answer length">
+      <span class="style-label" aria-hidden="true">Length</span>
       <button id="styleBrief" class="chip" type="button" data-style="brief" aria-pressed="false">Brief</button>
       <button id="styleBalanced" class="chip" type="button" data-style="balanced" aria-pressed="false">Balanced</button>
       <button id="styleDetailed" class="chip" type="button" data-style="detailed" aria-pressed="false">Detailed</button>
@@ -66,11 +102,21 @@
         <span class="gen-tag" id="genTag" hidden>generating…</span>
         <span class="latency" id="latencyTag" hidden></span>
         <div class="title-actions">
-          <button id="regenBtn" class="mini-btn" type="button" aria-label="Regenerate answer" hidden><span aria-hidden="true">&#8635;</span> Regenerate</button>
+          <button id="regenBtn" class="mini-btn" type="button" aria-label="Regenerate answer with original context" hidden><span aria-hidden="true">&#8635;</span> Original context</button>
           <button id="copyBtn" class="mini-btn" type="button" aria-label="Copy answer" hidden><span id="copyLabel">Copy</span></button>
         </div>
       </div>
       <div class="panel-body md" id="answerBox" aria-live="polite" aria-atomic="false" tabindex="0"><span class="placeholder">Your AI-suggested answer will stream here.</span></div>
+      <details id="entryContext" class="entry-context" hidden><summary>Context used for this answer</summary><pre id="entryContextText"></pre></details>
+      <details id="answerActions" class="answer-actions" hidden>
+        <summary>Refine or follow up</summary>
+        <div class="context-actions" role="group" aria-label="Refine selected answer">
+        <button id="regenCurrentBtn" type="button">Regenerate with current context</button>
+        <button id="shorterBtn" type="button">Shorter</button><button id="specificBtn" type="button">More specific</button>
+        <label class="sr-only" for="refineTone">New answer tone</label><select id="refineTone"><option value="diplomatic">Diplomatic</option><option value="confident">Confident</option><option value="conversational">Conversational</option></select><button id="toneBtn" type="button">Change tone</button>
+        <button id="editQuestionBtn" type="button">Edit question &amp; answer again</button><button id="followupBtn" type="button">Follow up on this entry</button>
+        </div>
+      </details>
     </section>
 
     <div class="error" id="errorBox" role="alert" hidden></div>
@@ -83,6 +129,7 @@
 
     <label for="deepgramKey">Deepgram API key <span class="hint">(live transcription) — <a href="https://console.deepgram.com/" target="_blank" rel="noreferrer">get one</a></span></label>
     <input type="password" id="deepgramKey" autocomplete="off" />
+    <label class="check"><input id="clearDeepgramKey" type="checkbox" /> Clear saved Deepgram key on Save</label>
 
     <label for="llmProvider">Answer model</label>
     <select id="llmProvider">
@@ -92,11 +139,13 @@
 
     <label for="anthropicKey">Anthropic API key <span class="hint"><a href="https://platform.claude.com/" target="_blank" rel="noreferrer">get one</a></span></label>
     <input type="password" id="anthropicKey" autocomplete="off" />
+    <label class="check"><input id="clearAnthropicKey" type="checkbox" /> Clear saved Anthropic key on Save</label>
 
     <label for="groqKey">Groq API key <span class="hint">(only for the Groq preset) — <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer">get one</a></span></label>
     <input type="password" id="groqKey" autocomplete="off" />
+    <label class="check"><input id="clearGroqKey" type="checkbox" /> Clear saved Groq key on Save</label>
 
-    <label for="answerStyle">Answer style</label>
+    <label for="answerStyle">Default answer length <span class="hint">(saved profiles may override)</span></label>
     <select id="answerStyle">
       <option value="brief">Brief — a few sentences, fastest to read</option>
       <option value="balanced">Balanced — a short structured answer</option>
@@ -121,7 +170,7 @@
       Keep window on top of the call app
     </label>
 
-    <p class="hint">API keys are stored encrypted on this machine and never shown again here. This window is always hidden from screen sharing and recordings.</p>
+    <p class="hint">API keys stay on this machine and are never shown again here. OS encryption is used when available; systems without it use a local plaintext fallback. Leave a key blank to keep it unchanged, or select its clear control. Screen-capture protection is requested; support depends on the capture app.</p>
 
     <div class="row">
       <button id="saveBtn" class="primary" type="button">Save</button>

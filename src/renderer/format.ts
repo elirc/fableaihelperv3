@@ -46,13 +46,13 @@ export function errorMessage(err: unknown): string {
 
 /** The headline latency chip: the one number this app exists to keep small. */
 export function latencyLabel(m: AnswerMetrics): string {
-  return `${(m.firstTokenMs / 1000).toFixed(1)}s to first word`;
+  return `${(m.firstTokenMs / 1000).toFixed(1)}s to first token received`;
 }
 
 /** Hover breakdown for the latency chip: per-stage timings behind the headline. */
 export function latencyTitle(m: AnswerMetrics): string {
   return (
-    `First word ${Math.round(m.firstTokenMs)} ms after Stop · ` +
+    `First token received ${Math.round(m.firstTokenMs)} ms after Stop / Ask · ` +
     `transcript finalized ${Math.round(m.sttFinalizeMs)} ms · ` +
     `full answer ${(m.totalMs / 1000).toFixed(1)} s`
   );

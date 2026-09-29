@@ -572,3 +572,474 @@ describe('createMarkdownView', () => {
     }
   });
 });
+
+// ---------- streaming invariants ----------
+//
+// update() commits a parsed prefix behind proven-safe blank-line boundaries
+// and re-parses only the tail. These suites are the safety net for that
+// optimization: any state where the incremental render diverges from a
+// one-shot batch render of the same text fails here, at the exact cut point.
+
+/** A one-shot render of `src` in a fresh view — the ground truth streaming must match. */
+function batchRender(src: string): string {
+  const { container, view } = makeView();
+  view.update(src);
+  return container.innerHTML;
+}
+
+/** Deterministic PRNG so "random" cut points are reproducible run to run. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const KITCHEN_SINK = [
+  '## Approach',
+  '',
+  'I led the **payments** migration; p99 went from `900ms` to `120ms`.',
+  '',
+  '- Shadow traffic first',
+  '  with a wrapped line',
+  '- Flag flip per region',
+  '',
+  '1. Measure',
+  '2. Migrate',
+  '3. Verify',
+  '',
+  '```ts',
+  'const p99 = measure();',
+  '',
+  'if (p99 > 120) rollback();',
+  '```',
+  '',
+  '---',
+  '',
+  'Ask me about *tricky **rollbacks*** anytime.',
+].join('\n');
+
+// Every document here is streamed at EVERY prefix, so cuts land inside `**`
+// runs, inside fence openers, between a CR and its LF, and inside surrogate
+// pairs — the exact states a per-token stream produces.
+const STREAM_DOCS: Array<[string, string]> = [
+  [
+    'plain paragraphs',
+    'First paragraph, several words long.\n\nSecond paragraph, a little longer than the first.\n\nThird.',
+  ],
+  [
+    'nested emphasis',
+    'Intro *em with **strong** inside* then **strong with *em* inside** plus `code *not em*` end.',
+  ],
+  [
+    'a fence containing markdown syntax',
+    'Before.\n\n```md\n# not a heading\n\n- not a list\n**not bold**\n```\n\nAfter fence.',
+  ],
+  [
+    'lists with lazy continuation',
+    '- first item\n  wrapped tail\n- second item\n\n1. one\nlazy line\n2. two\n\ntail para',
+  ],
+  ['loose and tight lists', '- a\n- b\n\n- c\n\nafter\n\n1. x\n\n2. y'],
+  ['headings and rules', '# Top\n\n## Sub ##\n\n---\n\n***\n\n___\n\n### C#\n\ndone'],
+  [
+    'CRLF line endings',
+    '## H\r\n\r\npara text\r\n\r\n- b\r\n- c\r\n\r\n```\r\ncode here\r\n```\r\n\r\ntail',
+  ],
+  ['lone-CR line endings', 'one\rtwo\r\rthree\n\n- item\n\ndone'],
+  [
+    'emoji and multibyte text',
+    'I 💡 shipped the 👨‍👩‍👧‍👦 release — **`café`** and *naïve* résumé.\n\n- ✅ done\n- 🚀 fast',
+  ],
+  ['the kitchen sink', KITCHEN_SINK],
+];
+
+describe('createMarkdownView streaming invariants', () => {
+  // The strongest property this module promises: at every single cut point the
+  // incrementally updated DOM is indistinguishable from a fresh batch render.
+  test.each(STREAM_DOCS)('every prefix of %s renders exactly like a batch render', (_name, doc) => {
+    const { container, view } = makeView();
+    for (let i = 1; i <= doc.length; i += 1) {
+      const prefix = doc.slice(0, i);
+      view.update(prefix);
+      expect(container.innerHTML).toBe(batchRender(prefix));
+    }
+  });
+
+  // Block-level DOM reuse: once a block's final node exists at its position it
+  // must never be rebuilt. Rebuilding would flicker, drop text selection, and
+  // reset scroll — the exact costs the diff exists to avoid.
+  test.each(STREAM_DOCS)('early-completed blocks of %s keep their DOM nodes to the end', (_name, doc) => {
+    const { container, view } = makeView();
+    const steps: Node[][] = [];
+    for (let i = 1; i <= doc.length; i += 1) {
+      view.update(doc.slice(0, i));
+      steps.push(Array.from(container.childNodes));
+    }
+    const final = steps[steps.length - 1] ?? [];
+    final.forEach((node, col) => {
+      const born = steps.findIndex((s) => s[col] === node);
+      expect(born).toBeGreaterThanOrEqual(0);
+      for (let t = born; t < steps.length; t += 1) {
+        expect(steps[t]?.[col]).toBe(node);
+      }
+    });
+  });
+
+  test('a long document streamed at random cut points matches batch at every cut', () => {
+    // Three kitchen sinks back to back: enough length that several committed-
+    // prefix advances happen mid-stream, with jumps that skip whole blocks.
+    const doc = [KITCHEN_SINK, KITCHEN_SINK, KITCHEN_SINK].join('\n\n');
+    const rand = mulberry32(0xc0ffee);
+    const cuts = new Set<number>();
+    for (let i = 0; i < 60; i += 1) cuts.add(1 + Math.floor(rand() * doc.length));
+    cuts.add(doc.length);
+    const { container, view } = makeView();
+    for (const cut of [...cuts].sort((a, b) => a - b)) {
+      view.update(doc.slice(0, cut));
+      expect(container.innerHTML).toBe(batchRender(doc.slice(0, cut)));
+    }
+  });
+
+  test('streaming in random multi-character chunks matches batch at every step', () => {
+    // Real deltas arrive as multi-character tokens, not single characters, so
+    // several lines (even whole blocks) can appear in one update.
+    const rand = mulberry32(1234);
+    const { container, view } = makeView();
+    let sent = 0;
+    while (sent < KITCHEN_SINK.length) {
+      sent = Math.min(KITCHEN_SINK.length, sent + 1 + Math.floor(rand() * 7));
+      view.update(KITCHEN_SINK.slice(0, sent));
+      expect(container.innerHTML).toBe(batchRender(KITCHEN_SINK.slice(0, sent)));
+    }
+  });
+
+  test('repeating an identical update produces zero mutation records', () => {
+    // app.ts re-renders once per animation frame whether or not a delta
+    // arrived; an unchanged frame must not touch the DOM at all.
+    const doc = '## Done\n\nAll **set**.\n\n- a\n- b\n\n```\nx\n```';
+    const { container, view } = makeView();
+    view.update(doc);
+
+    const observer = new MutationObserver(() => {});
+    observer.observe(container, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+    });
+    view.update(doc);
+    expect(observer.takeRecords()).toEqual([]);
+    observer.disconnect();
+  });
+
+  test('a dash arriving after a loose-list blank line rejoins the list above it', () => {
+    // The hardest committed-prefix hazard: "- a\n\n" looks finished, but a
+    // later "- b" turns it back into one loose list. A prefix committed too
+    // eagerly would freeze two separate lists into the DOM.
+    const { container, view } = makeView();
+    for (const prefix of ['- a', '- a\n', '- a\n\n', '- a\n\n-', '- a\n\n- ', '- a\n\n- b']) {
+      view.update(prefix);
+      expect(container.innerHTML).toBe(batchRender(prefix));
+    }
+    expect(container.querySelectorAll('ul')).toHaveLength(1);
+    expect(container.querySelectorAll('ul > li')).toHaveLength(2);
+  });
+
+  test('blank lines inside a streaming fence never split the code block', () => {
+    // Inside an open fence a blank line is content, not a block boundary; a
+    // boundary committed there would tear the code block in two for good.
+    const doc = '```\nfirst\n\nsecond\n\nthird\n```\n\nafter';
+    const { container, view } = makeView();
+    for (let i = 1; i <= doc.length; i += 1) {
+      view.update(doc.slice(0, i));
+      expect(container.innerHTML).toBe(batchRender(doc.slice(0, i)));
+    }
+    expect(container.querySelectorAll('pre')).toHaveLength(1);
+    expect(container.querySelector('pre > code')?.textContent).toBe('first\n\nsecond\n\nthird');
+  });
+
+  test('a complete rewrite (regenerate) renders exactly like a batch render of the new text', () => {
+    // Regenerate replaces the source wholesale; stale committed state from the
+    // first answer must not leak into the second.
+    const { container, view } = makeView();
+    const first = '## Old\n\n- a\n\n- b\n\nold tail';
+    for (let i = 1; i <= first.length; i += 1) view.update(first.slice(0, i));
+
+    const second = 'Fresh start.\n\n1. one\n2. two\n\n```\nnew code\n```';
+    view.update(second);
+    expect(container.innerHTML).toBe(batchRender(second));
+
+    // …and streaming may resume on top of the rewrite.
+    const extended = `${second}\n\nmore`;
+    view.update(extended);
+    expect(container.innerHTML).toBe(batchRender(extended));
+  });
+
+  test('shrinking the source to an earlier prefix re-renders that prefix exactly', () => {
+    // Shrinking (re-record, edited re-ask) is not an append; committed blocks
+    // beyond the new end must vanish, while untouched leading blocks keep
+    // their nodes through the structural diff.
+    const full = 'One.\n\nTwo.\n\n- a\n- b\n\nThree.';
+    const { container, view } = makeView();
+    view.update(full);
+    const p1 = container.children[0];
+
+    const prefix = 'One.\n\nTwo.';
+    view.update(prefix);
+    expect(container.innerHTML).toBe(batchRender(prefix));
+    expect(container.children[0]).toBe(p1);
+  });
+
+  test('a same-length different source is not mistaken for an append', () => {
+    // Only a strict-prefix relation may reuse committed state; equal length
+    // with a different tail must take the rewrite path.
+    const a = 'stable one\n\nstable two\n\ntail AAA';
+    const b = 'stable one\n\nstable two\n\ntail BBB';
+    const { container, view } = makeView();
+    for (let i = 1; i <= a.length; i += 1) view.update(a.slice(0, i));
+    const stable = container.children[0];
+
+    view.update(b);
+    expect(container.innerHTML).toBe(batchRender(b));
+    // The unchanged leading block still keeps its node across the rewrite.
+    expect(container.children[0]).toBe(stable);
+  });
+
+  test('a placeholder shown mid-stream does not poison a later resumed render', () => {
+    // Reconnect flows swap in a placeholder and then resume streaming; the
+    // placeholder must not survive, and the resumed render must be exact.
+    const { container, view } = makeView();
+    view.update('## Head\n\nfirst words');
+    view.placeholder('Reconnecting…');
+    expect(container.querySelector('.placeholder')).not.toBeNull();
+
+    const full = '## Head\n\nfirst words and the rest.\n\n- done';
+    view.update(full);
+    expect(container.querySelector('.placeholder')).toBeNull();
+    expect(container.innerHTML).toBe(batchRender(full));
+  });
+
+  test('clear mid-stream resets committed state so a new stream renders fresh', () => {
+    // clear() runs between history entries; internal prefix state left behind
+    // would misalign every diff of the next answer.
+    const { container, view } = makeView();
+    const first = '- a\n\n- b\n\nfirst answer tail';
+    for (let i = 1; i <= first.length; i += 1) view.update(first.slice(0, i));
+    view.clear();
+    expect(container.childNodes).toHaveLength(0);
+
+    const second = '# Second\n\ndifferent **answer**';
+    for (let i = 1; i <= second.length; i += 1) view.update(second.slice(0, i));
+    expect(container.innerHTML).toBe(batchRender(second));
+  });
+});
+
+// ---------- parser edge cases ----------
+
+describe('parseInline edge cases', () => {
+  test('an escaped star inside italic stays literal text', () => {
+    // The findClose skip for escaped delimiters must apply mid-span, not just
+    // at the closer; a miss here would end the emphasis at the escaped star.
+    expect(parseInline('*a\\*b*')).toEqual([
+      { type: 'em', children: [{ type: 'text', value: 'a*b' }] },
+    ]);
+  });
+
+  test('an escaped star inside bold stays literal text', () => {
+    // Same guard for the double-delimiter scan, which takes a separate path
+    // through findClose (no single-run skips).
+    expect(parseInline('**a\\*b**')).toEqual([
+      { type: 'strong', children: [{ type: 'text', value: 'a*b' }] },
+    ]);
+  });
+
+  test('word-adjacent underscores never open or close emphasis', () => {
+    // canOpen blocks the intraword open, findClose blocks the intraword close;
+    // both directions must hold or identifiers grow phantom emphasis.
+    expect(parseInline('_foo_bar')).toEqual([{ type: 'text', value: '_foo_bar' }]);
+    expect(parseInline('foo_bar_')).toEqual([{ type: 'text', value: 'foo_bar_' }]);
+  });
+
+  test('***bold italic*** degrades to strong plus a stray star, with no character loss', () => {
+    // CommonMark nests em inside strong here; this subset deliberately does
+    // not. Pinned so any future change to triple-run handling is a conscious
+    // one — the invariant that matters is that every character stays visible.
+    expect(parseInline('***bi***')).toEqual([
+      { type: 'strong', children: [{ type: 'text', value: '*bi' }] },
+      { type: 'text', value: '*' },
+    ]);
+    expect(text(parseInline('***bi***'))).toBe('*bi*');
+  });
+
+  test('overlapping delimiters resolve to the first-opened pair', () => {
+    // `*foo _bar* baz_` cannot nest; the star pair wins and the underscores
+    // stay literal rather than producing crossed markup or a crash.
+    expect(parseInline('*foo _bar* baz_')).toEqual([
+      { type: 'em', children: [{ type: 'text', value: 'foo _bar' }] },
+      { type: 'text', value: ' baz_' },
+    ]);
+  });
+
+  test('emphasis may wrap a code span', () => {
+    // The recursive parse inside a delimiter pair must still find code spans,
+    // or `*a `b` c*` would emphasize raw backticks.
+    expect(parseInline('*a `b` c*')).toEqual([
+      {
+        type: 'em',
+        children: [
+          { type: 'text', value: 'a ' },
+          { type: 'code', value: 'b' },
+          { type: 'text', value: ' c' },
+        ],
+      },
+    ]);
+  });
+
+  test('emphasis delimiters work around multibyte text', () => {
+    // Flanking checks read one UTF-16 unit; a surrogate half must count as
+    // non-space so emoji-adjacent bold still opens.
+    expect(parseInline('**🎉 café**')).toEqual([
+      { type: 'strong', children: [{ type: 'text', value: '🎉 café' }] },
+    ]);
+  });
+
+  test('an escaped backtick never opens a code span', () => {
+    // Backslash handling runs before the backtick branch; a regression would
+    // swallow the text up to the next real backtick as "code".
+    expect(parseInline('\\`not code\\`')).toEqual([{ type: 'text', value: '`not code`' }]);
+  });
+
+  test('backslashes inside a code span are kept verbatim', () => {
+    // Code spans are atomic: no escape processing may run inside, or Windows
+    // paths and regexes in answers would lose characters.
+    expect(parseInline('`C:\\njs\\*`')).toEqual([{ type: 'code', value: 'C:\\njs\\*' }]);
+  });
+});
+
+describe('parseMarkdown edge cases', () => {
+  test('an empty list item is kept as an empty item, not dropped', () => {
+    // The model sometimes streams "- " and pauses; collapsing the item would
+    // renumber/reflow the list when its text arrives.
+    expect(parseMarkdown('- a\n- \n- b')).toEqual([
+      {
+        type: 'ul',
+        items: [[{ type: 'text', value: 'a' }], [], [{ type: 'text', value: 'b' }]],
+      },
+    ]);
+  });
+
+  test('a list item containing only inline code keeps the code node', () => {
+    // Items run the full inline grammar even when code is the entire content.
+    expect(parseMarkdown('- `npm test`')).toEqual([
+      { type: 'ul', items: [[{ type: 'code', value: 'npm test' }]] },
+    ]);
+  });
+
+  test('"- -" is a one-item list, not a rule', () => {
+    // Two dashes are one short of HR_RE's minimum; the line must fall through
+    // to the list branch, mirroring how "- - -" falls the other way.
+    expect(parseMarkdown('- -')).toEqual([
+      { type: 'ul', items: [[{ type: 'text', value: '-' }]] },
+    ]);
+  });
+
+  test('two blank lines end a loose list where one would not', () => {
+    // The loose-list lookahead reads exactly one line; a second blank line
+    // breaks the list. Pinned because the streaming boundary scanner models
+    // this exact lookahead.
+    expect(parseMarkdown('- a\n\n- b').map((b) => b.type)).toEqual(['ul']);
+    expect(parseMarkdown('- a\n\n\n- b').map((b) => b.type)).toEqual(['ul', 'ul']);
+  });
+
+  test('hash runs with no text: "##" is prose, "# #" keeps its hash', () => {
+    // HEADING_RE requires whitespace after the opening run, and the decorative
+    // closing run needs whitespace before it — with neither, hashes are text.
+    expect(parseMarkdown('##')[0]?.type).toBe('p');
+    expect(parseMarkdown('# #')).toEqual([
+      { type: 'heading', level: 1, children: [{ type: 'text', value: '#' }] },
+    ]);
+    expect(parseMarkdown('## ##')).toEqual([
+      { type: 'heading', level: 2, children: [{ type: 'text', value: '##' }] },
+    ]);
+  });
+
+  test('the fence info string is dropped for backtick and tilde fences alike', () => {
+    // The language tag has no CSS hook by design; it must vanish from the AST
+    // for both fence characters, not just backticks.
+    expect(parseMarkdown('```python\nprint(1)\n```')).toEqual([{ type: 'code', text: 'print(1)' }]);
+    expect(parseMarkdown('~~~ruby\nputs 1\n~~~')).toEqual([{ type: 'code', text: 'puts 1' }]);
+  });
+
+  test('a bare fence opener at EOF is an empty code block, not a crash', () => {
+    // The instant a code answer starts streaming, the source ends in exactly
+    // this state.
+    expect(parseMarkdown('```')).toEqual([{ type: 'code', text: '' }]);
+    expect(parseMarkdown('```ts')).toEqual([{ type: 'code', text: '' }]);
+  });
+
+  test('ordered lists keep unusual but valid start numbers', () => {
+    // 0 is falsy and an easy victim of a `start || 1` refactor; nine digits is
+    // the last width OL_RE accepts.
+    expect(parseMarkdown('0. zero\n1. one')[0]).toMatchObject({ type: 'ol', start: 0 });
+    expect(parseMarkdown('123456789. big')[0]).toMatchObject({ type: 'ol', start: 123456789 });
+  });
+
+  test('two-character rule candidates stay prose', () => {
+    // One character short of a thematic break on both alphabets; eagerly
+    // matching would turn streamed half-rules into permanent hrs.
+    expect(parseMarkdown('**')).toEqual([{ type: 'p', children: [{ type: 'text', value: '**' }] }]);
+    expect(parseMarkdown('--')).toEqual([{ type: 'p', children: [{ type: 'text', value: '--' }] }]);
+  });
+});
+
+// ---------- additional hostility ----------
+
+describe('createMarkdownView hostility', () => {
+  test('hostile text in headings and list items never becomes markup', () => {
+    // Headings and list items feed appendInlines through different block
+    // renderers; each path must keep tag-shaped text inert.
+    const { container, view } = makeView();
+    view.update('# <script>alert(1)</script>\n\n- <img src=x onerror=alert(1)>');
+    expect(container.querySelector('script, img')).toBeNull();
+    expect(container.querySelector('h3')?.textContent).toBe('<script>alert(1)</script>');
+    expect(container.querySelector('li')?.textContent).toBe('<img src=x onerror=alert(1)>');
+    for (const el of allElements(container)) expect(el.attributes).toHaveLength(0);
+  });
+
+  test('attribute-injection text inside inline code stays inside the code element', () => {
+    // Inline code writes via textContent on a fresh element; quote-heavy
+    // payloads must never migrate into attribute position anywhere.
+    const { container, view } = makeView();
+    view.update('run `" onmouseover="alert(1)` now');
+    expect(container.querySelector('p > code')?.textContent).toBe('" onmouseover="alert(1)');
+    for (const el of allElements(container)) expect(el.attributes).toHaveLength(0);
+  });
+
+  test('serialized innerHTML shows escaped entities, proving text-node insertion', () => {
+    // The strongest observable form of "never innerHTML": the serializer shows
+    // `<` and `&` from model text as entities, and pre-escaped text is
+    // escaped again rather than passed through.
+    const { container, view } = makeView();
+    view.update('<b>&amp;</b> & "quotes"');
+    expect(container.textContent).toBe('<b>&amp;</b> & "quotes"');
+    expect(container.innerHTML).toContain('&lt;b&gt;');
+    expect(container.innerHTML).toContain('&amp;amp;');
+    expect(container.innerHTML).not.toContain('<b>');
+  });
+
+  test('a fence body cannot break out of its pre element', () => {
+    // A `</pre>` inside code is the classic sandbox escape when code blocks
+    // are string-concatenated; here it must remain literal text inside one pre.
+    const { container, view } = makeView();
+    view.update('```\n</pre><script>alert(1)</script>\n```');
+    expect(container.querySelectorAll('pre')).toHaveLength(1);
+    expect(container.querySelector('script')).toBeNull();
+    expect(container.querySelector('pre > code')?.textContent).toBe(
+      '</pre><script>alert(1)</script>',
+    );
+  });
+});

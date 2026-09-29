@@ -1,6 +1,7 @@
 import { DEFAULT_HOTKEY } from '../shared/types';
+import { createDefaultProfile, createProfile, resolveContext, cloneContext, boundRelatedAnswer, DEFAULT_OUTPUT, CONTEXT_LIMITS } from '../shared/context';
 import type {
-  AnswerMetrics,
+  ContextSnapshot, ScenarioProfile, Situation, RelatedAnswer, OutputPreferences,
   AnswerStyle,
   LlmProviderId,
   RendererApi,
@@ -9,7 +10,10 @@ import type {
   SettingsView,
 } from '../shared/types';
 import { errorMessage, formatAccelerator, formatTimer, latencyLabel, latencyTitle } from './format';
+import { createHistory } from './history';
 import { createMarkdownView } from './markdown';
+import { stateUi } from './ui-state';
+import type { State } from './ui-state';
 
 declare global {
   interface Window {
@@ -63,9 +67,6 @@ const TRANSCRIPT_PLACEHOLDER = 'The live transcript will appear here while you r
 const answerView = createMarkdownView(answerBox);
 
 // ---------- State ----------
-// 'starting' exists so a stop pressed while the session/capture is still coming
-// up is honoured instead of silently dropped.
-type State = 'idle' | 'starting' | 'recording' | 'finalizing' | 'answering';
 let state: State = 'idle';
 let sessionId: number | null = null;
 let capture: Capture | null = null;
@@ -77,14 +78,183 @@ let timerInterval: ReturnType<typeof setInterval> | null = null;
 let hotkeyLabel = '';
 let hotkeyActive = false;
 
-interface Entry {
-  question: string;
-  answer: string;
-  metrics: AnswerMetrics | null;
-  live: boolean;
+const history = createHistory(MAX_HISTORY);
+let settingsCache: SettingsView | null = null;
+let contextReady = false;
+let profileBusy = false;
+let profiles: ScenarioProfile[] = [createDefaultProfile()];
+let activeProfileId = profiles[0]!.id;
+let pendingFollowup: RelatedAnswer | undefined;
+let requestFollowup: RelatedAnswer | undefined;
+let editingContext: ContextSnapshot | undefined;
+let noteRevision = 0;
+let requestNoteRevision: number | null = null;
+let awaitingSession = false;
+let earlyEvents: Array<() => void> = [];
+const noteInput = $<HTMLTextAreaElement>('questionNote');
+noteInput.addEventListener('input', () => { noteRevision += 1; syncContextSummary(); });
+noteInput.maxLength = CONTEXT_LIMITS.questionNote;
+$<HTMLTextAreaElement>('contextBackground').maxLength = CONTEXT_LIMITS.background;
+$<HTMLTextAreaElement>('contextInstructions').maxLength = CONTEXT_LIMITS.instructions;
+$<HTMLInputElement>('profileName').maxLength = CONTEXT_LIMITS.name;
+
+function adoptSession(id: number): void {
+  sessionId = id;
+  awaitingSession = false;
+  const events = earlyEvents;
+  earlyEvents = [];
+  events.forEach((event) => event());
 }
-let entries: Entry[] = [];
-let viewIndex = -1;
+
+function buffered<T>(handler: (event: T) => void): (event: T) => void {
+  return (event) => {
+    if (awaitingSession && sessionId === null) earlyEvents.push(() => handler(event));
+    else handler(event);
+  };
+}
+
+function activeProfile(): ScenarioProfile {
+  return profiles.find((profile) => profile.id === activeProfileId) ?? profiles[0]!;
+}
+
+function currentContext(): ContextSnapshot {
+  return resolveContext({
+    alwaysOnTop: false, llmProvider: 'anthropic', hotkey: '', hotkeyRegistered: false,
+    hasDeepgramKey: false, hasAnthropicKey: false, hasGroqKey: false,
+    resume: settingsCache?.resume ?? '', jobDescription: settingsCache?.jobDescription ?? '',
+    answerStyle: settingsCache?.answerStyle ?? 'balanced', outputDefaults: settingsCache?.outputDefaults,
+    contextProfiles: profiles, activeProfileId,
+  }, { questionNote: noteInput.value, followUp: pendingFollowup });
+}
+
+function requestContext(snapshot?: ContextSnapshot): ContextSnapshot {
+  const context = snapshot ? cloneContext(snapshot) : currentContext();
+  requestNoteRevision = snapshot ? null : noteRevision;
+  requestFollowup = snapshot ? undefined : pendingFollowup;
+  return context;
+}
+
+function syncContextSummary(): void {
+  const p = activeProfile();
+  const output = { ...DEFAULT_OUTPUT, answerStyle: settingsCache?.answerStyle ?? 'balanced', ...settingsCache?.outputDefaults, ...p.output };
+  $('contextSummary').textContent = `${p.name} · ${output.answerStyle}${noteInput.value ? ' · note' : ''}`;
+  $('contextSummary').title = `${p.situation} · ${output.format} · ${output.tone} · ${output.audience}${p.background ? ' · background' : ''}${p.includeResume ? ' · resume included' : ''}${p.includeJobDescription ? ' · job description included' : ''}${p.instructions ? ' · instructions set' : ''}`;
+  $('contextTiming').textContent = state === 'idle'
+    ? 'Changes apply when you next press Record or Ask. Profiles are saved only with Save profile.'
+    : 'This answer uses its captured context. Changes apply to the next question.';
+  syncStyleChips(output.answerStyle);
+}
+
+function fillContextForm(): void {
+  const p = activeProfile();
+  const select = $<HTMLSelectElement>('profileSelect');
+  select.replaceChildren(...profiles.map((profile) => {
+    const option = document.createElement('option'); option.value = profile.id; option.textContent = profile.name; return option;
+  }));
+  select.value = p.id;
+  $<HTMLInputElement>('profileName').value = p.name;
+  $<HTMLSelectElement>('scenario').value = p.situation;
+  $<HTMLTextAreaElement>('contextBackground').value = p.background;
+  $<HTMLTextAreaElement>('contextInstructions').value = p.instructions;
+  $<HTMLInputElement>('includeResume').checked = p.includeResume;
+  $<HTMLInputElement>('includeJobDescription').checked = p.includeJobDescription;
+  const output = { ...DEFAULT_OUTPUT, answerStyle: settingsCache?.answerStyle ?? 'balanced', ...settingsCache?.outputDefaults, ...p.output };
+  $<HTMLSelectElement>('answerFormat').value = output.format;
+  $<HTMLSelectElement>('answerTone').value = output.tone;
+  $<HTMLSelectElement>('answerAudience').value = output.audience;
+  $<HTMLButtonElement>('profileDelete').disabled = profiles.length <= 1;
+  syncContextSummary();
+}
+
+function loadContextSettings(settings: SettingsView): void {
+  settingsCache = settings;
+  profiles = settings.contextProfiles?.length ? settings.contextProfiles.map((p) => ({ ...p, output: { ...p.output } })) : [createDefaultProfile(settings.answerStyle)];
+  activeProfileId = settings.activeProfileId ?? profiles[0]!.id;
+  if (!profiles.some((p) => p.id === activeProfileId)) activeProfileId = profiles[0]!.id;
+  fillContextForm();
+}
+
+async function saveProfiles(nextProfiles: ScenarioProfile[], nextId: string): Promise<void> {
+  const view = await api.saveSettings({ contextProfiles: nextProfiles, activeProfileId: nextId });
+  settingsCache = view;
+  profiles = nextProfiles;
+  activeProfileId = nextId;
+  $('profileStatus').textContent = 'Profile saved';
+  fillContextForm();
+}
+
+function lockProfileControls(locked: boolean): void {
+  profileBusy = locked;
+  document.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLButtonElement | HTMLTextAreaElement>('#contextPanel input, #contextPanel select, #contextPanel button, #contextPanel textarea, .style-row button').forEach((control) => { control.disabled = locked; });
+  if (!locked) $<HTMLButtonElement>('profileDelete').disabled = profiles.length <= 1;
+}
+
+for (const id of ['scenario', 'contextBackground', 'contextInstructions', 'includeResume', 'includeJobDescription', 'answerFormat', 'answerTone', 'answerAudience']) {
+  $(id).addEventListener('input', () => {
+    const p = activeProfile();
+    if (id === 'scenario') {
+      const template = createProfile($<HTMLSelectElement>('scenario').value as Situation);
+      if (!p.instructions || p.instructions === createProfile(p.situation).instructions) $<HTMLTextAreaElement>('contextInstructions').value = template.instructions;
+      $<HTMLInputElement>('includeResume').checked = template.includeResume;
+      $<HTMLInputElement>('includeJobDescription').checked = template.includeJobDescription;
+    }
+    p.situation = $<HTMLSelectElement>('scenario').value as Situation;
+    p.background = $<HTMLTextAreaElement>('contextBackground').value;
+    p.instructions = $<HTMLTextAreaElement>('contextInstructions').value;
+    p.includeResume = $<HTMLInputElement>('includeResume').checked;
+    p.includeJobDescription = $<HTMLInputElement>('includeJobDescription').checked;
+    p.output = { ...p.output, format: $<HTMLSelectElement>('answerFormat').value as OutputPreferences['format'], tone: $<HTMLSelectElement>('answerTone').value as OutputPreferences['tone'], audience: $<HTMLSelectElement>('answerAudience').value as OutputPreferences['audience'] };
+    $('profileStatus').textContent = 'Unsaved profile changes · active for the next question';
+    syncContextSummary();
+  });
+}
+$('profileSelect').addEventListener('change', () => {
+  if (profileBusy) return;
+  activeProfileId = $<HTMLSelectElement>('profileSelect').value;
+  fillContextForm();
+  void api.saveSettings({ activeProfileId }).catch(showError);
+});
+for (const action of ['New', 'Duplicate', 'Rename', 'Delete', 'Save']) {
+  $(`profile${action}`).addEventListener('click', async () => {
+    if (profileBusy) return;
+    lockProfileControls(true);
+    try {
+      let nextProfiles = profiles.map((p) => ({ ...p, output: { ...p.output } }));
+      let nextId = activeProfileId;
+      const p = nextProfiles.find((p) => p.id === nextId)!;
+      const name = $<HTMLInputElement>('profileName').value.trim();
+      if (action === 'New' || action === 'Duplicate') {
+        if (profiles.length >= CONTEXT_LIMITS.profiles) { $('profileStatus').textContent = 'Up to 20 profiles can be saved. Delete a profile first.'; return; }
+        const id = crypto.randomUUID();
+        const next = action === 'New' ? createProfile('custom', id, 'New profile') : { ...p, id, name: `${p.name} copy`.slice(0, 80), output: { ...p.output } };
+        nextProfiles.push(next); nextId = id;
+      } else if (action === 'Delete') {
+        if (profiles.length <= 1) return;
+        nextProfiles = nextProfiles.filter((item) => item.id !== p.id); nextId = nextProfiles[0]!.id;
+      } else {
+        if (!name) { $('profileStatus').textContent = 'Enter a profile name.'; return; }
+        p.name = name;
+      }
+      await saveProfiles(nextProfiles, nextId);
+    } catch (err) { $('profileStatus').textContent = 'Could not save. Your draft is still available.'; showError(err); }
+    finally { lockProfileControls(false); }
+  });
+}
+const instructionTemplates: Record<string, string> = {
+  star: 'For experience questions, use Situation, Task, Action, Result. Use only supplied facts; ask for missing details.',
+  tradeoffs: 'Explain the main options, their trade-offs, and a recommendation with its assumptions.',
+  clarify: 'If essential facts are missing, ask a concise clarifying question. Do not invent experience or outcomes.',
+  actions: 'Focus on decisions, open questions, and concrete next actions. Do not invent owners or deadlines.',
+};
+$('applyTemplate').addEventListener('click', () => {
+  const template = instructionTemplates[$<HTMLSelectElement>('instructionTemplate').value];
+  if (!template) return;
+  const field = $<HTMLTextAreaElement>('contextInstructions');
+  field.value = [field.value.trim(), template].filter(Boolean).join('\n').slice(0, CONTEXT_LIMITS.instructions);
+  field.dispatchEvent(new Event('input'));
+});
+$('cancelFollowup').addEventListener('click', () => { pendingFollowup = undefined; $('followupBanner').hidden = true; });
+$('cancelEditQuestion').addEventListener('click', () => { editingContext = undefined; $('editBanner').hidden = true; });
 
 const readyText = (): string =>
   hotkeyActive ? `Ready — press Record or ${hotkeyLabel}` : BASE_READY_TEXT;
@@ -193,10 +363,16 @@ async function stopPending(p: Promise<Capture>): Promise<void> {
 
 // ---------- Recording lifecycle ----------
 async function startRecording(): Promise<void> {
+  if (!contextReady) return;
+  editingContext = undefined;
+  $('editBanner').hidden = true;
   const myRun = ++runId;
   clearError();
   sessionId = null;
-  beginLiveEntry();
+  const context = requestContext();
+  history.beginLive(context);
+  awaitingSession = true;
+  earlyEvents = [];
   setState('starting');
 
   const frames: ArrayBuffer[] = [];
@@ -217,9 +393,10 @@ async function startRecording(): Promise<void> {
   // arriving while `sessionId` is still null matches nothing and is dropped —
   // leaving the renderer recording into a socket main has already torn down.
   // Capture can take far longer than the STT connect, so that window is real.
-  const sessionPromise = api.startSession().then((r) => {
+  const sessionPromise = api.startSession({ snapshot: context }).then((r) => {
     if (r.ok && myRun === runId) {
-      sessionId = r.value;
+      adoptSession(r.value);
+      if (myRun !== runId) return r;
       mySessionId = r.value;
       // Flush here, not after Promise.all: once mySessionId is set onFrame
       // sends live, so buffered frames must go out first or the question's
@@ -253,7 +430,7 @@ async function startRecording(): Promise<void> {
     if (myRun !== runId) return; // a newer run owns the UI now
     sessionId = null;
     endCapture();
-    dropLiveEntry();
+    history.dropLive();
     setState('idle');
     showError(err);
     return;
@@ -302,11 +479,12 @@ function abortStarting(): void {
   runId += 1; // the in-flight startRecording will stop its capture and cancel its session
   sessionId = null;
   endCapture();
-  dropLiveEntry();
+  history.dropLive();
   setState('idle');
 }
 
 function toggleRecording(): void {
+  if (!contextReady) return;
   switch (state) {
     case 'recording':
       void stopRecording();
@@ -329,7 +507,8 @@ function toggleRecording(): void {
  * stt:partial, then llm:delta / llm:done / session:error — so the existing
  * handlers do all the rendering work.
  */
-async function submitAsk(text: string): Promise<void> {
+async function submitAsk(text: string, snapshot?: ContextSnapshot): Promise<void> {
+  if (!contextReady) return;
   // Claim the UI the way onSessionError does: an in-flight recording start
   // whose token is now stale must tear itself down instead of adopting the UI
   // mid-ask. Asking over a still-streaming answer is fine — main aborts the
@@ -338,17 +517,19 @@ async function submitAsk(text: string): Promise<void> {
   const myRun = ++runId;
   sessionId = null;
   clearError();
-  beginLiveEntry();
-  const live = liveEntry();
-  if (live) live.question = text; // the transcript box shows the question immediately
+  const context = requestContext(snapshot);
+  const live = history.beginLive(context);
+  awaitingSession = true;
+  earlyEvents = [];
+  live.question = text; // the transcript box shows the question immediately
   setState('answering');
 
   let result: Result<number>;
   try {
-    result = await api.askQuestion(text);
+    result = await api.askQuestion(text, { snapshot: context });
   } catch (err) {
     if (myRun !== runId) return; // a newer run owns the UI now
-    dropLiveEntry();
+    history.dropLive();
     setState('idle');
     showError(err);
     return;
@@ -359,10 +540,11 @@ async function submitAsk(text: string): Promise<void> {
     return;
   }
   if (result.ok) {
-    sessionId = result.value;
-    askInput.value = '';
+    adoptSession(result.value);
+    if (snapshot && editingContext === snapshot) { editingContext = undefined; $('editBanner').hidden = true; }
+    if (askInput.value.trim() === text) askInput.value = '';
   } else {
-    dropLiveEntry();
+    history.dropLive();
     setState('idle');
     showError(result.error);
   }
@@ -372,83 +554,85 @@ askForm.addEventListener('submit', (e) => {
   e.preventDefault();
   const text = askInput.value.trim();
   if (text === '' || askInput.disabled) return;
-  void submitAsk(text);
+  const snapshot = editingContext;
+  void submitAsk(text, snapshot);
 });
 
 regenBtn.addEventListener('click', () => {
-  const q = entries[viewIndex]?.question.trim() ?? '';
+  const q = history.viewed()?.question.trim() ?? '';
   if (q === '' || (state !== 'idle' && state !== 'answering')) return;
-  void submitAsk(q);
+  void submitAsk(q, history.viewed()?.context);
+});
+
+function refineAnswer(instruction: string, overrides: Partial<OutputPreferences> = {}): void {
+  const entry = history.viewed();
+  if (!entry?.question || (state !== 'idle' && state !== 'answering')) return;
+  const snapshot = cloneContext(entry.context ?? currentContext());
+  snapshot.relatedAnswer = boundRelatedAnswer({ question: entry.question, answer: entry.answer });
+  snapshot.refinement = instruction;
+  snapshot.output = { ...snapshot.output, ...overrides };
+  void submitAsk(entry.question, snapshot);
+}
+$('regenCurrentBtn').addEventListener('click', () => {
+  const question = history.viewed()?.question;
+  if (question && (state === 'idle' || state === 'answering')) void submitAsk(question);
+});
+$('shorterBtn').addEventListener('click', () => refineAnswer('Make the previous AI suggestion shorter while preserving the essential answer.', { answerStyle: 'brief' }));
+$('specificBtn').addEventListener('click', () => refineAnswer('Make the previous AI suggestion more specific using supplied facts. Flag missing facts; do not invent details.'));
+$('toneBtn').addEventListener('click', () => {
+  const tone = $<HTMLSelectElement>('refineTone').value as OutputPreferences['tone'];
+  refineAnswer(`Rewrite the previous AI suggestion in a ${tone} tone.`, { tone });
+});
+$('editQuestionBtn').addEventListener('click', () => {
+  const entry = history.viewed();
+  if (!entry || askInput.disabled) return;
+  askInput.value = entry.question;
+  editingContext = entry.context ? cloneContext(entry.context) : undefined;
+  $('editBanner').hidden = !editingContext;
+  $('editLabel').textContent = `Edited question will use the original context: ${entry.context?.profileName ?? ''}.`;
+  askInput.focus();
+  announce('Edit the question, then press Ask to answer again with its original context.');
+});
+$('followupBtn').addEventListener('click', () => {
+  const entry = history.viewed();
+  if (!entry || askInput.disabled) return;
+  pendingFollowup = boundRelatedAnswer({ question: entry.question, answer: entry.answer });
+  editingContext = undefined;
+  $('editBanner').hidden = true;
+  $('followupLabel').textContent = `Next question follows: ${entry.question.slice(0, 120)}. Prior answer is an AI suggestion, not something you said.`;
+  $('followupBanner').hidden = false;
+  askInput.focus();
 });
 
 function setState(next: State): void {
   state = next;
+  if (next === 'idle') { awaitingSession = false; earlyEvents = []; }
+  const ui = stateUi(next, readyText());
   recordBtn.classList.toggle('recording', next === 'recording');
-  // The ask box stays usable while an answer streams (asking aborts the old
-  // session), but not while audio capture is in any stage of flight.
-  const askLocked = next === 'starting' || next === 'recording' || next === 'finalizing';
-  askInput.disabled = askLocked;
-  askBtn.disabled = askLocked;
-  switch (next) {
-    case 'idle':
-      recordLabel.textContent = 'Record';
-      statusDot.className = 'dot';
-      statusText.textContent = readyText();
-      break;
-    case 'starting':
-      recordLabel.textContent = 'Starting…';
-      statusDot.className = 'dot busy';
-      statusText.textContent = 'Opening the microphone feed…';
-      break;
-    case 'recording':
-      recordLabel.textContent = 'Stop & Answer';
-      statusDot.className = 'dot recording';
-      statusText.textContent = 'Recording call audio…';
-      break;
-    case 'finalizing':
-      recordLabel.textContent = 'Record';
-      statusDot.className = 'dot busy';
-      statusText.textContent = 'Finalizing transcript…';
-      break;
-    case 'answering':
-      recordLabel.textContent = 'Record';
-      statusDot.className = 'dot busy';
-      statusText.textContent = 'Generating answer…';
-      break;
-  }
-  renderEntry();
-}
-
-// ---------- History ----------
-const viewingLive = (): boolean => entries.length > 0 && viewIndex === entries.length - 1;
-const liveEntry = (): Entry | undefined => {
-  const last = entries[entries.length - 1];
-  return last?.live ? last : undefined;
-};
-
-function beginLiveEntry(): void {
-  entries.push({ question: '', answer: '', metrics: null, live: true });
-  if (entries.length > MAX_HISTORY) entries = entries.slice(entries.length - MAX_HISTORY);
-  viewIndex = entries.length - 1;
-  renderEntry();
-}
-
-/** Retire the live entry; discard it only when it captured nothing at all. */
-function dropLiveEntry(): void {
-  const idx = entries.length - 1;
-  const e = entries[idx];
-  if (!e?.live) return;
-  if (e.question.trim() === '' && e.answer.trim() === '') entries.splice(idx, 1);
-  else e.live = false;
-  viewIndex = Math.min(viewIndex, entries.length - 1);
+  askInput.disabled = ui.askLocked || !contextReady;
+  askBtn.disabled = ui.askLocked || !contextReady;
+  recordBtn.disabled = !contextReady;
+  $('meterRow').hidden = next !== 'recording' && next !== 'starting';
+  recordLabel.textContent = ui.recordLabel;
+  statusDot.className = ui.dotClass;
+  statusText.textContent = ui.statusText;
+  syncContextSummary();
   renderEntry();
 }
 
 // ---------- Rendering ----------
 let renderQueued = false;
 let renderedIndex = -1;
+let renderedContext: ContextSnapshot | undefined;
 /** Answer source currently in the DOM; '' means the placeholder is showing (as in index.html). */
 let answerShown = '';
+/**
+ * Transcript text currently in the DOM (question or placeholder text), seeded
+ * with the placeholder index.html ships. Tracked in a variable because this is
+ * compared every animation frame while the transcript streams, and reading
+ * `textContent` re-serializes the node's text on each call.
+ */
+let transcriptShown = TRANSCRIPT_PLACEHOLDER;
 
 /** Coalesce token-rate updates to one paint per frame. */
 function scheduleRender(): void {
@@ -471,17 +655,23 @@ function setPlaceholder(el: HTMLElement, text: string): void {
 }
 
 function renderEntry(): void {
-  const e = entries[viewIndex];
+  const e = history.viewed();
+  const viewIndex = history.viewIndex();
+  const count = history.count();
   const switched = renderedIndex !== viewIndex;
   renderedIndex = viewIndex;
 
   // Transcript (speech, not markdown — plain text with pre-wrap).
   if (!e || e.question === '') {
     const listening = state === 'recording' || state === 'starting';
-    const text = listening && viewingLive() ? 'Listening…' : TRANSCRIPT_PLACEHOLDER;
-    if (transcriptBox.textContent !== text) setPlaceholder(transcriptBox, text);
-  } else if (transcriptBox.textContent !== e.question) {
+    const text = listening && history.viewingLive() ? 'Listening…' : TRANSCRIPT_PLACEHOLDER;
+    if (transcriptShown !== text) {
+      setPlaceholder(transcriptBox, text);
+      transcriptShown = text;
+    }
+  } else if (transcriptShown !== e.question) {
     transcriptBox.textContent = e.question;
+    transcriptShown = e.question;
   }
 
   // Answer: keep the view pinned to the bottom only if it already was, so
@@ -505,8 +695,8 @@ function renderEntry(): void {
   // Streaming answers are announced once, on completion, rather than per token.
   answerBox.setAttribute('aria-busy', state === 'answering' ? 'true' : 'false');
 
-  liveTag.hidden = !(state === 'recording' && viewingLive());
-  genTag.hidden = !(state === 'answering' && viewingLive());
+  liveTag.hidden = !(state === 'recording' && history.viewingLive());
+  genTag.hidden = !(state === 'answering' && history.viewingLive());
   copyBtn.hidden = !e || e.answer === '';
   // Regenerate re-asks the viewed question; only offered when a question exists
   // and no recording is in flight (answering is fine — main aborts the old run).
@@ -517,6 +707,13 @@ function renderEntry(): void {
   );
 
   const m = e?.metrics;
+  $('answerActions').hidden = !e?.question || (state !== 'idle' && state !== 'answering');
+  $('entryContext').hidden = !e?.context;
+  if (e?.context && renderedContext !== e.context) {
+    const c = e.context;
+    $('entryContextText').textContent = `${c.profileName} · ${c.situation}\n${c.output.answerStyle} · ${c.output.format} · ${c.output.tone} · ${c.output.audience}\nBackground: ${c.background || '(none)'}\nInstructions: ${c.instructions || '(none)'}\nResume: ${c.resume || '(excluded or empty)'}\nJob description: ${c.jobDescription || '(excluded or empty)'}\nQuestion note: ${c.questionNote || '(none)'}${c.relatedAnswer ? '\nSelected prior question: ' + c.relatedAnswer.question + '\nPrior AI suggestion: ' + c.relatedAnswer.answer : ''}${c.refinement ? '\nRefinement: ' + c.refinement : ''}`;
+  }
+  renderedContext = e?.context;
   if (m) {
     latencyTag.hidden = false;
     latencyTag.textContent = latencyLabel(m);
@@ -525,33 +722,29 @@ function renderEntry(): void {
     latencyTag.hidden = true;
   }
 
-  historyBar.hidden = entries.length <= 1;
-  historyLabel.textContent = entries.length > 0 ? `${viewIndex + 1}/${entries.length}` : '';
+  historyBar.hidden = count <= 1;
+  // Guarded like the transcript: assigning textContent replaces the text node
+  // even when the string is identical, and this runs once per frame mid-stream.
+  const label = count > 0 ? `${viewIndex + 1}/${count}` : '';
+  if (historyLabel.textContent !== label) historyLabel.textContent = label;
   prevBtn.disabled = viewIndex <= 0;
-  nextBtn.disabled = viewIndex >= entries.length - 1;
-  clearBtn.disabled = state !== 'idle' || entries.length === 0;
+  nextBtn.disabled = viewIndex >= count - 1;
+  clearBtn.disabled = state !== 'idle' || count === 0;
 }
 
 // ---------- UI wiring ----------
 recordBtn.addEventListener('click', () => toggleRecording());
 
 prevBtn.addEventListener('click', () => {
-  if (viewIndex > 0) {
-    viewIndex -= 1;
-    renderEntry();
-  }
+  if (history.prev()) renderEntry();
 });
 nextBtn.addEventListener('click', () => {
-  if (viewIndex < entries.length - 1) {
-    viewIndex += 1;
-    renderEntry();
-  }
+  if (history.next()) renderEntry();
 });
 
 clearBtn.addEventListener('click', () => {
-  if (state !== 'idle' || entries.length === 0) return;
-  entries = [];
-  viewIndex = -1;
+  if (state !== 'idle' || history.count() === 0) return;
+  history.clear();
   renderedIndex = -1;
   renderEntry(); // placeholders return; the history bar hides itself
   announce('History cleared');
@@ -567,38 +760,43 @@ api.onHotkeyToggle(() => {
 });
 
 // ---------- Session events (all filtered by current session) ----------
-api.onSttPartial((e) => {
+api.onSttPartial(buffered((e) => {
   if (e.sessionId !== sessionId) return;
-  const live = liveEntry();
+  const live = history.live();
   if (!live || !e.text) return;
   live.question = e.text;
   scheduleRender();
-});
+}));
 
-api.onLlmDelta((e) => {
+api.onLlmDelta(buffered((e) => {
   if (e.sessionId !== sessionId) return;
   if (state !== 'answering') setState('answering');
-  const live = liveEntry();
+  const live = history.live();
   if (!live) return;
   live.answer += e.delta;
   scheduleRender();
-});
+}));
 
-api.onLlmDone((e) => {
+api.onLlmDone(buffered((e) => {
   if (e.sessionId !== sessionId) return;
   sessionId = null;
-  const live = liveEntry();
+  const live = history.live();
   if (live) {
     live.question = e.transcript;
     live.answer = e.answer;
     live.metrics = e.metrics;
     live.live = false;
+    if (e.context) live.context = cloneContext(e.context);
   }
+  if (requestNoteRevision !== null && noteRevision === requestNoteRevision) noteInput.value = '';
+  requestNoteRevision = null;
+  if (requestFollowup && pendingFollowup === requestFollowup) { pendingFollowup = undefined; $('followupBanner').hidden = true; }
+  requestFollowup = undefined;
   setState('idle');
   statusText.textContent = 'Done — press Record for the next question';
-});
+}));
 
-api.onSessionError((e) => {
+api.onSessionError(buffered((e) => {
   if (e.sessionId !== sessionId) return;
   // The session can die while startRecording is still awaiting capture. Retire
   // the run so it finds itself superseded and tears down, instead of reaching
@@ -606,16 +804,16 @@ api.onSessionError((e) => {
   runId += 1;
   sessionId = null;
   endCapture();
-  dropLiveEntry();
+  history.dropLive();
   setState('idle');
   showError(e.error);
-});
+}));
 
 let copyTimer: ReturnType<typeof setTimeout> | null = null;
 copyBtn.addEventListener('click', () => {
   // Copy the markdown source, not the rendered DOM: bullets and code fences
   // survive the paste.
-  const text = entries[viewIndex]?.answer ?? '';
+  const text = history.viewed()?.answer ?? '';
   if (!text) return;
   void navigator.clipboard
     .writeText(text)
@@ -656,9 +854,8 @@ const asProvider = (v: string): LlmProviderId => (PROVIDERS.includes(v) ? (v as 
 const asStyle = (v: string): AnswerStyle => (STYLES.includes(v) ? (v as AnswerStyle) : 'balanced');
 
 // ---------- Answer-style quick toggle ----------
-// Flipping the style is latency-free by design: the cached prompt prefix is
-// split before the style suffix, so a flip never invalidates the cached
-// resume+JD block (see README, "Prompt caching, honestly").
+// Length changes preserve the stable prompt prefix. Actual latency still
+// depends on context size, cache eligibility, the provider, and the network.
 const styleChips = [
   $<HTMLButtonElement>('styleBrief'),
   $<HTMLButtonElement>('styleBalanced'),
@@ -673,10 +870,17 @@ function syncStyleChips(style: AnswerStyle): void {
 
 for (const chip of styleChips) {
   chip.addEventListener('click', async () => {
+    if (profileBusy) return;
+    const targetId = activeProfileId;
     try {
-      // Reflect what main persisted, not what was clicked.
-      const view = await api.saveSettings({ answerStyle: asStyle(chip.dataset.style ?? '') });
-      syncStyleChips(view.answerStyle);
+      const answerStyle = asStyle(chip.dataset.style ?? '');
+      const persisted = settingsCache?.contextProfiles ?? [createDefaultProfile(settingsCache?.answerStyle)];
+      const updated = persisted.map((p) => p.id === targetId ? { ...p, output: { ...p.output, answerStyle } } : p);
+      const view = await api.saveSettings({ answerStyle, contextProfiles: updated });
+      const target = profiles.find((p) => p.id === targetId);
+      if (target) target.output.answerStyle = view.contextProfiles?.find((p) => p.id === targetId)?.output.answerStyle ?? view.answerStyle;
+      settingsCache = view;
+      syncContextSummary();
     } catch (err) {
       showError(err);
     }
@@ -712,10 +916,12 @@ function fillSettingsForm(s: SettingsView): void {
   $<HTMLInputElement>('anthropicKey').placeholder = s.hasAnthropicKey ? '••••••••  (saved — type to replace)' : 'sk-ant-...';
   $<HTMLInputElement>('groqKey').placeholder = s.hasGroqKey ? '••••••••  (saved — type to replace)' : 'gsk_...';
   for (const f of keyFields) $<HTMLInputElement>(f).value = '';
+  for (const id of ['clearDeepgramKey', 'clearAnthropicKey', 'clearGroqKey']) $<HTMLInputElement>(id).checked = false;
   applyHotkeyUi(s);
 }
 
 function openSettings(s: SettingsView): void {
+  if (!contextReady) { loadContextSettings(s); contextReady = true; setState(state); }
   fillSettingsForm(s);
   settingsError.hidden = true;
   mainView.hidden = true;
@@ -761,12 +967,16 @@ $('saveBtn').addEventListener('click', async () => {
   for (const f of keyFields) {
     const v = $<HTMLInputElement>(f).value.trim();
     if (v) patch[f] = v;
+    const clearId = `clear${f.charAt(0).toUpperCase()}${f.slice(1)}`;
+    if ($<HTMLInputElement>(clearId).checked) patch[f] = '';
   }
   try {
     const view = await api.saveSettings(patch);
+    settingsCache = view;
+    if (!view.contextProfiles?.length) activeProfile().output.answerStyle = view.answerStyle;
     settingsError.hidden = true;
     fillSettingsForm(view);
-    syncStyleChips(view.answerStyle); // keep the main-view chips honest too
+    syncContextSummary();
     const savedNote = $('savedNote');
     savedNote.hidden = false;
     if (savedTimer) clearTimeout(savedTimer);
@@ -782,11 +992,16 @@ $('saveBtn').addEventListener('click', async () => {
 });
 
 // First run: nudge toward settings if keys are missing.
+recordBtn.disabled = true;
+askBtn.disabled = true;
+askInput.disabled = true;
 void (async () => {
   try {
     const s = await api.getSettings();
+    loadContextSettings(s);
+    contextReady = true;
+    setState(state);
     applyHotkeyUi(s);
-    syncStyleChips(s.answerStyle);
     const missingLlmKey = s.llmProvider === 'groq' ? !s.hasGroqKey : !s.hasAnthropicKey;
     if ((!s.hasDeepgramKey || missingLlmKey) && state === 'idle') {
       statusText.textContent = 'First run: open Settings (gear icon) and add your API keys';

@@ -663,3 +663,37 @@ describe('groq provider — single retry on connection failure', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('provider context parity', () => {
+  test('both providers send identical context instructions and bounded explicit follow-up data', async () => {
+    const { legacyContext, buildSystemPromptBlocks, buildUserMessage } = await import('../src/main/prompt');
+    const snapshot = legacyContext('Supported experience', 'Role context', 'brief');
+    snapshot.situation = 'client';
+    snapshot.background = 'Supported product facts';
+    snapshot.instructions = 'Offer a practical next step';
+    snapshot.output = { answerStyle: 'brief', format: 'talking-points', tone: 'diplomatic', audience: 'nontechnical' };
+    snapshot.questionNote = 'Do not promise a deadline';
+    snapshot.relatedAnswer = { question: 'Can you deliver?', answer: 'An earlier unconfirmed suggestion' };
+    snapshot.refinement = 'Make it clearer';
+    const fetchMock = vi.fn(async (..._args: FetchArgs) => anthropicStream([['ok']]));
+    vi.stubGlobal('fetch', fetchMock);
+    await createAnthropicProvider('key', snapshot).generate('What next?', noop, new AbortController().signal);
+    const anthropicBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    fetchMock.mockImplementation(async () => new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', {
+      status: 200, headers: { 'content-type': 'text/event-stream' },
+    }));
+    await createGroqProvider('key', snapshot).generate('What next?', noop, new AbortController().signal);
+    const groqBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
+    const blocks = buildSystemPromptBlocks(snapshot);
+    expect(anthropicBody.system).toEqual([
+      { type: 'text', text: blocks.cachedPrefix, cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: blocks.styleSuffix },
+    ]);
+    expect(groqBody.messages[0]).toEqual({ role: 'system', content: blocks.cachedPrefix + '\n\n' + blocks.styleSuffix });
+    expect(anthropicBody.messages).toEqual(groqBody.messages.slice(1));
+    expect(anthropicBody.messages).toEqual([{ role: 'user', content: buildUserMessage('What next?', snapshot) }]);
+    expect(anthropicBody.messages[0].content).toContain('unconfirmed generated suggestion');
+    expect(anthropicBody.system[0].text).not.toContain('Do not promise a deadline');
+    expect(anthropicBody.system[0].text).not.toContain('An earlier unconfirmed suggestion');
+  });
+});

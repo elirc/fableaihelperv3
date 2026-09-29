@@ -1,9 +1,16 @@
-# AI Call Assistant v2
+# AI Call Assistant
 
-Push-to-record interview copilot for Windows. Captures system audio (the other
+**Context & Instructions:** tailor answers with saved interview, technical,
+client, meeting, or custom profiles; background and custom instructions;
+independent length, format, tone, and audience; and a note for the next question.
+Regenerate with original or current context, refine an answer, or explicitly
+follow up on the selected entry. See [the context guide](docs/CONTEXT.md) for
+behavior, limits, migration, and validation.
+
+Push-to-record call assistant for Windows. Captures system audio (the other
 person's voice on a call), streams it to a live transcript **while they are
 still speaking**, and starts streaming an AI-suggested answer within about a
-second of pressing Stop.
+second of pressing Stop under favorable provider and network conditions.
 
 This is the v2 rewrite of `Desktop/aihelper`: same interaction model and
 Windows loopback/screen-hide moat, new pipeline built for latency.
@@ -58,6 +65,14 @@ Don't take the latency on faith — the UI reports the real number
   renderer only ever sees `hasKey` flags. `settings.json` is zod-validated on
   read (per-field fallback, so one bad value can't cost you your resume) and
   written atomically via write-then-rename
+- **Production hardening**: single-instance lock (a second launch focuses the
+  running window instead of fighting it for the hotkey and settings file); the
+  renderer runs with the full Chromium **sandbox** enabled; uncaught
+  main-process errors are appended to `%APPDATA%/AI Call Assistant/crash.log`
+  instead of killing the app mid-interview; a crashed renderer is reloaded
+  (once per 10 s) rather than left as a frozen window; window size/position
+  persist across launches, with off-screen positions recovered when a monitor
+  disappears
 - Window is `setContentProtection(true)` — invisible to screen shares.
 
 ### In the window
@@ -70,21 +85,26 @@ Don't take the latency on faith — the UI reports the real number
   the fallback when call audio isn't available, and the way to ask your own
   follow-ups. Runs through the same session pipeline (same events, same
   timeouts, same metrics with the STT stage at 0 ms).
-- **Regenerate** — re-asks the viewed entry's question as a fresh answer (new
-  history entry), so a weak answer costs one click, not a re-record.
-- **Answer style** — brief / balanced / detailed, switchable from the main view
-  via a chip toggle (also in Settings). `balanced` is v1's wording verbatim, so
-  the default behaviour is unchanged — and a style flip is latency-free by
-  design, because the cached prompt prefix is split before the style suffix.
-- **Latency readout** — "X.Xs to first word" per answer; hover for the STT
-  finalize / first token / total breakdown.
+- **Regenerate and refine** — re-ask the viewed question with its original
+  context snapshot or the current controls. Shorter, More specific, Change tone,
+  and Edit question create a new history entry. Follow-up context is explicit
+  and bounded; prior AI suggestions are never treated as confirmed user speech.
+- **Answer length** — brief / balanced / detailed, independently combined with
+  format, tone, and audience. Presentation changes preserve the stable cached
+  prefix; they are not a guarantee of identical latency.
+- **Latency readout** — time to first token received by the main process, with
+  STT finalize / first token / total breakdown. It excludes IPC and UI painting.
 - **History** — last 6 Q/A pairs, arrow-key-free prev/next in the panel header,
   plus a clear button (enabled while idle).
 - **Markdown answers** — dependency-free streaming renderer. Every string
   reaches the DOM via `createTextNode`/`textContent`, never `innerHTML`; links
   are deliberately not parsed, so there's no href to sanitize. Diffs at block
   level, so completed paragraphs keep their nodes (no flicker, no lost
-  selection). Page CSP is `default-src 'self'; style-src 'self'`.
+  selection) — and re-parses only past the last proven-safe block boundary, so
+  a streaming frame costs O(tail), not O(document) (~5× faster streaming a long
+  answer; an unchanged frame is a single string compare). A large invariant
+  suite pins incremental rendering byte-identical to a batch render at every
+  cut point. Page CSP is `default-src 'self'; style-src 'self'`.
 - **Accessibility** — `aria-live` on the answer panel (announced on completion,
   not per token), `role="alert"` errors, focus moved into and back out of
   Settings, Escape to close, visible focus rings, `prefers-reduced-motion`.
@@ -123,15 +143,20 @@ Keys are stored encrypted per-machine and can be replaced but never read back.
 | Command | What it does |
 |---|---|
 | `npm start` | Build everything and launch Electron |
-| `npm test` | Vitest suite (379 tests across 10 files) |
+| `npm test` | Offline Vitest unit and component suite |
+| `npm run test:ui` | Build and exercise the actual Electron renderer with isolated fake providers; save layout screenshots |
 | `npm run typecheck` | Strict TS across main + renderer |
 | `npm run dist` | Windows NSIS installer via electron-builder |
 
 Tests cover prompt building, SSE parsing, PCM helpers, Deepgram frame parsing +
-stream lifecycle, the session manager (recorded and typed questions), the
-settings store, the LLM providers, the connection pre-warm, the renderer's
-display formatters, and the markdown parser + streaming DOM view. No Electron
-and no network needed. **Every test is documented in
+stream lifecycle, the session manager (recorded and typed questions, plus
+supersession/timeout stress), the IPC layer (validation, Result envelopes,
+event forwarding, the audio fast path), the settings store, the LLM providers
+and their shared retry policy, the connection pre-warm, window-bounds
+sanitization, the renderer's display formatters, the history/state modules, the
+markdown parser + streaming DOM view (including streaming-vs-batch invariants),
+and the full renderer glue driven against the real markup under happy-dom. No
+Electron and no network needed. **Every test is documented in
 [docs/TESTING.md](docs/TESTING.md)** — what it verifies and why it exists.
 
 ## Layout
@@ -142,27 +167,38 @@ src/
     types.ts      IPC contract, error codes, AnswerMetrics, DEFAULT_HOTKEY
     pcm.ts        pure PCM helpers (shared by tests and both processes)
   main/
-    main.ts       window, loopback grant, content protection, global shortcut
+    main.ts       window, loopback grant, content protection, global shortcut,
+                  single-instance lock, crash log, renderer crash recovery
+    bounds.ts     pure window-geometry sanitization for restoring saved bounds
     ipc.ts        zod-validated handlers; events tagged { sessionId }; pre-warm calls
     session.ts    one active session; new session aborts old; timeouts; metrics;
-                  ask() for typed/re-asked questions (no STT stage)
+                  ask() for typed/re-asked questions (no STT stage); the shared
+                  guard/stream pipeline both paths run through
     sse.ts        OpenAI-style SSE chunk/tail parser (used by Groq)
-    stt/deepgram.ts   WS client: keepalive, finalize, mid-stream error reporting
+    stt/deepgram.ts   WS client: keepalive, finalize, mid-stream error reporting,
+                      O(1) committed-transcript accumulation
     llm/anthropic.ts  Haiku 4.5, two-block system prompt, one connection retry
     llm/groq.ts       OpenAI-compatible SSE streaming, reasoning suppressed,
                       one connection retry, 1024-token completion cap
+    llm/retry.ts  the one-retry-on-connection-failure policy both providers share
     llm/warm.ts   throttled fire-and-forget TLS pre-warm of the provider origin
     prompt.ts     system prompt split at the cache breakpoint (pure, tested)
-    store.ts      zod-validated settings + safeStorage-encrypted keys; atomic write
+    store.ts      zod-validated settings + safeStorage-encrypted keys; atomic
+                  write; window-bounds persistence
   preload.ts      typed contextBridge with unsubscribe functions
   renderer/
-    app.ts        state machine: idle → starting → recording → finalizing → answering
+    app.ts        glue: idle → starting → recording → finalizing → answering,
+                  wired over the pure history/ui-state modules
+    history.ts    pure Q/A history: live-entry lifecycle, trim, view cursor
+    ui-state.ts   pure per-state UI descriptor (labels, dot, status, ask lock)
     format.ts     pure display helpers: accelerator labels, timer, latency strings
-    markdown.ts   markdown subset: pure parser + streaming DOM view (XSS-safe)
+    markdown.ts   markdown subset: pure parser + streaming DOM view (XSS-safe,
+                  committed-prefix incremental — O(tail) per streamed frame)
     index.html    main + settings views, ask box, style chips
     styles.css    dark theme, AA-contrast palette, focus rings
     public/pcm-worklet.js  capture → downsample → Int16 frames + level meter
-test/             379 vitest tests, no Electron or network needed
+test/             Vitest tests, no Electron or network needed
+scripts/ui-smoke.cjs  isolated Electron renderer/preload smoke checks, no live APIs
 docs/TESTING.md   every test documented: what it verifies and why it exists
 ```
 

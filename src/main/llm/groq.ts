@@ -1,7 +1,8 @@
-import type { AnswerStyle, AppError } from '../../shared/types';
+import type { AnswerStyle, AppError, ContextSnapshot } from '../../shared/types';
 import type { LlmProvider } from '../session';
-import { buildSystemPrompt, buildUserMessage } from '../prompt';
+import { buildSystemPrompt, buildUserMessage, legacyContext } from '../prompt';
 import { parseSSEChunk, parseSSETail } from '../sse';
+import { retryOnceIf } from './retry';
 
 // Groq — the user-selectable "fastest" preset. OpenAI-compatible SSE
 // streaming, parsed with the same battle-tested chunk parser v1 used for
@@ -31,11 +32,12 @@ const MAX_COMPLETION_TOKENS = 1024;
 
 export function createGroqProvider(
   apiKey: string,
-  resume: string,
-  jd: string,
-  answerStyle: AnswerStyle,
+  contextOrResume: ContextSnapshot | string,
+  jd = '',
+  answerStyle: AnswerStyle = 'balanced',
 ): LlmProvider {
-  const system = buildSystemPrompt(resume, jd, answerStyle);
+  const context = typeof contextOrResume === 'string' ? legacyContext(contextOrResume, jd, answerStyle) : contextOrResume;
+  const system = buildSystemPrompt(context);
 
   return {
     async generate(transcript, onDelta, signal) {
@@ -50,7 +52,7 @@ export function createGroqProvider(
         include_reasoning: false,
         messages: [
           { role: 'system', content: system },
-          { role: 'user', content: buildUserMessage(transcript) },
+          { role: 'user', content: buildUserMessage(transcript, context) },
         ],
       });
       const attempt = (): Promise<Response> =>
@@ -66,11 +68,6 @@ export function createGroqProvider(
 
       let res: Response;
       try {
-        res = await attempt();
-      } catch {
-        // fetch rejects with an AbortError when the session cancels us. That is
-        // not a failure the user should ever see.
-        if (signal.aborted) throw abortedError();
         // Retry parity with the Anthropic provider: a rejected fetch means the
         // request never landed — no HTTP status, no bytes on screen — so one
         // immediate retry is strictly better than an error mid-interview.
@@ -80,15 +77,16 @@ export function createGroqProvider(
         // burns the first-token budget), and a mid-stream drop is handled
         // below without a retry (the renderer appends deltas, so a second
         // attempt would concatenate two answers).
-        try {
-          res = await attempt();
-        } catch {
-          if (signal.aborted) throw abortedError();
-          throw {
-            code: 'llm_http',
-            message: 'Could not reach Groq. Check your internet connection.',
-          } satisfies AppError;
-        }
+        res = await retryOnceIf(attempt, () => !signal.aborted);
+      } catch {
+        // fetch rejects with an AbortError when the session cancels us — also
+        // checked here in case the abort landed between the two attempts. That
+        // is not a failure the user should ever see.
+        if (signal.aborted) throw abortedError();
+        throw {
+          code: 'llm_http',
+          message: 'Could not reach Groq. Check your internet connection.',
+        } satisfies AppError;
       }
 
       if (!res.ok) {

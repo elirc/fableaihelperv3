@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import type { AnswerMetrics, AppError } from '../src/shared/types';
 import {
   SessionManager,
@@ -402,20 +402,15 @@ describe('SessionManager STT stream errors', () => {
     expect(log.at(-1)).toMatchObject({ type: 'done', sessionId: id });
   });
 
-  test('an error queued before wiring is delivered, not dropped', async () => {
+  test('an error queued before wiring rejects start before the renderer adopts its id', async () => {
     const stt = new PreFailedStt();
     const { log, events } = collectEvents();
     const mgr = new SessionManager({ createStt: async () => stt, createLlm: () => fakeLlm(), events });
 
-    const id = await mgr.start();
-
-    // The session must be torn down and the user told, rather than left
-    // recording into a socket that is already dead.
-    expect(log).toEqual([
-      { type: 'error', sessionId: id, data: { code: 'stt_error', message: 'socket closed before wiring' } },
-    ]);
+    await expect(mgr.start()).rejects.toEqual({ code: 'stt_error', message: 'socket closed before wiring' });
+    expect(log).toEqual([]);
     expect(stt.aborted).toBe(true);
-    mgr.audio(id, new ArrayBuffer(4));
+    mgr.audio(1, new ArrayBuffer(4));
     expect(stt.received).toEqual([]);
   });
 
@@ -788,5 +783,444 @@ describe('toAppError', () => {
 
   test('wraps plain errors with the fallback code', () => {
     expect(toAppError(new Error('boom'), 'llm_http')).toEqual({ code: 'llm_http', message: 'boom' });
+  });
+
+  test('wraps a bare string throw with the fallback code and the string as message', () => {
+    // `throw 'text'` exists in the wild (and in dependency code); it must reach
+    // the renderer as a structured error, not crash the mapper.
+    expect(toAppError('socket hang up')).toEqual({ code: 'internal', message: 'socket hang up' });
+  });
+
+  test('wraps null and undefined without crashing', () => {
+    // `'code' in err` throws on null; the null-check guard is what this pins.
+    expect(toAppError(null)).toEqual({ code: 'internal', message: 'null' });
+    expect(toAppError(undefined, 'stt_error')).toEqual({ code: 'stt_error', message: 'undefined' });
+  });
+
+  test('an object with a non-string code is not mistaken for an AppError', () => {
+    // An HTTP-ish `{ code: 500 }` shape must not smuggle a number into a field
+    // the renderer switches on as a string.
+    expect(toAppError({ code: 500, message: 'server error' }, 'llm_http')).toEqual({
+      code: 'llm_http',
+      message: '[object Object]',
+    });
+  });
+
+  test('an object missing either half of the pair falls to the fallback', () => {
+    expect(toAppError({ code: 'llm_auth' }, 'llm_http')).toEqual({ code: 'llm_http', message: '[object Object]' });
+    expect(toAppError({ message: 'no code here' }, 'llm_http')).toEqual({
+      code: 'llm_http',
+      message: '[object Object]',
+    });
+    expect(toAppError({ code: 'llm_auth', message: 42 }, 'llm_http')).toEqual({
+      code: 'llm_http',
+      message: '[object Object]',
+    });
+  });
+
+  test('a Node-style Error carrying a string code passes through structured', () => {
+    // Documented behavior, not an accident: fs/net errors carry string codes
+    // (ENOENT, ECONNRESET). They satisfy the structural check, so the code
+    // survives into the event and the renderer's unknown-code fallback renders
+    // the message — strictly more diagnostic than flattening to 'internal'.
+    const nodeErr = Object.assign(new Error('connect ECONNRESET'), { code: 'ECONNRESET' });
+    expect(toAppError(nodeErr)).toEqual({ code: 'ECONNRESET', message: 'connect ECONNRESET' });
+  });
+});
+
+// Interleavings a fast-fingered user (or a laggy network) can actually produce.
+// Each one pins a different corner of the one-live-session invariant: whoever
+// acted last owns the slot, and every loser goes silent instead of leaking
+// events, sockets, or a stolen `active`.
+describe('SessionManager concurrency stress', () => {
+  test('a second ask() supersedes the first mid-stream; only the newest answers', async () => {
+    const { log, events } = collectEvents();
+    let call = 0;
+    const mgr = new SessionManager({
+      createStt: async () => new FakeStt(),
+      // First ask gets a slow provider so the second lands mid-stream.
+      createLlm: () => (call++ === 0 ? fakeLlm('first answer', 100) : fakeLlm('second answer', 10)),
+      events,
+    });
+
+    const id1 = await mgr.ask('first question');
+    await until(() => log.some((e) => e.type === 'partial' && e.sessionId === id1)); // LLM 1 in flight
+    const id2 = await mgr.ask('second question');
+
+    await until(() => log.some((e) => e.type === 'done'));
+    await sleep(150); // long enough for the aborted first LLM to have surfaced anything
+
+    // The superseded ask must vanish silently: no answer, no error — the user
+    // re-asked and only the new answer may paint.
+    expect(log.filter((e) => e.sessionId === id1 && e.type !== 'partial')).toEqual([]);
+    expect(log.filter((e) => e.type === 'done')).toEqual([
+      expect.objectContaining({ sessionId: id2, data: expect.objectContaining({ answer: 'second answer' }) }),
+    ]);
+  });
+
+  test('cancel racing a stop mid-finalize suppresses the entire pipeline', async () => {
+    const stt = new FakeStt();
+    stt.finalizeDelay = 50;
+    const { log, events } = collectEvents();
+    const mgr = new SessionManager({ createStt: async () => stt, createLlm: () => fakeLlm(), events });
+
+    const id = await mgr.start();
+    const stopping = mgr.stop(id);
+    await sleep(10); // finalize in flight, transcript not yet final
+    mgr.cancel(id);
+
+    // The stop legitimately took the session before the cancel — true is the
+    // honest answer even though the pipeline will now go quiet.
+    expect(await stopping).toBe(true);
+    expect(stt.aborted).toBe(true);
+    await sleep(100); // let the orphaned finalize resolve into the stale check
+
+    // Not even the final partial may fire: the user cancelled before the
+    // transcript existed, so nothing it fed may reach the renderer.
+    expect(log).toEqual([]);
+  });
+
+  test('a stop that lands while start() is still connecting takes nothing and spares the session', async () => {
+    const stt = new FakeStt();
+    const gate = deferred<SttStream>();
+    const { events } = collectEvents();
+    const mgr = new SessionManager({ createStt: () => gate.promise, createLlm: () => fakeLlm(), events });
+
+    const starting = mgr.start();
+    // The hotkey toggles record/stop, so a stop can race the connect. The id
+    // the session WILL get is 1 (first session of this manager) — even that
+    // must be refused while nothing is installed yet.
+    expect(await mgr.stop(1)).toBe(false);
+
+    gate.resolve(stt);
+    const id = await starting;
+    // The refused stop did not poison the session: it records and stops normally.
+    const frame = new ArrayBuffer(8);
+    mgr.audio(id, frame);
+    expect(stt.received).toEqual([frame]);
+    expect(await mgr.stop(id)).toBe(true);
+  });
+
+  test('a new start() while the previous stop is mid-LLM silences that answer', async () => {
+    const first = new FakeStt();
+    const second = new FakeStt();
+    const streams = [first, second];
+    const { log, events } = collectEvents();
+    const mgr = new SessionManager({
+      createStt: async () => streams.shift()!,
+      createLlm: () => fakeLlm('slow answer', 100),
+      events,
+    });
+
+    const id1 = await mgr.start();
+    const stopping = mgr.stop(id1);
+    await until(() => log.some((e) => e.type === 'partial' && e.sessionId === id1)); // LLM in flight
+    const id2 = await mgr.start();
+    expect(await stopping).toBe(true);
+    await sleep(150); // the aborted LLM settles
+
+    // The half-answered question dies silently; the new recording is live.
+    expect(log.filter((e) => e.sessionId === id1 && e.type !== 'partial')).toEqual([]);
+    const frame = new ArrayBuffer(8);
+    mgr.audio(id2, frame);
+    expect(second.received).toEqual([frame]);
+    expect(first.aborted).toBe(true);
+  });
+
+  test('an ask() while the previous stop is mid-LLM pivots to the typed question', async () => {
+    const stt = new FakeStt();
+    const { log, events } = collectEvents();
+    let call = 0;
+    const mgr = new SessionManager({
+      createStt: async () => stt,
+      createLlm: () => (call++ === 0 ? fakeLlm('recorded answer', 100) : fakeLlm('typed answer', 10)),
+      events,
+    });
+
+    const recId = await mgr.start();
+    const stopping = mgr.stop(recId);
+    await until(() => log.some((e) => e.type === 'partial' && e.sessionId === recId)); // LLM in flight
+    const askId = await mgr.ask('typed question');
+    expect(await stopping).toBe(true);
+
+    await until(() => log.some((e) => e.type === 'done'));
+    await sleep(150);
+
+    // Only the typed question answers; the recorded one is silent past its partial.
+    expect(log.filter((e) => e.sessionId === recId && e.type !== 'partial')).toEqual([]);
+    expect(log.filter((e) => e.type === 'done')).toEqual([
+      expect.objectContaining({ sessionId: askId, data: expect.objectContaining({ answer: 'typed answer' }) }),
+    ]);
+    expect(stt.aborted).toBe(true);
+  });
+
+  test('audio sent after stop() was called is dropped, not fed into the finalize', async () => {
+    const stt = new FakeStt();
+    stt.finalizeDelay = 50;
+    const { events } = collectEvents();
+    const mgr = new SessionManager({ createStt: async () => stt, createLlm: () => fakeLlm(), events });
+
+    const id = await mgr.start();
+    const beforeStop = new ArrayBuffer(4);
+    mgr.audio(id, beforeStop);
+    const stopping = mgr.stop(id);
+    mgr.audio(id, new ArrayBuffer(8)); // straggler frame from the capture pipeline
+
+    await stopping;
+    // Frames after stop can no longer influence the transcript; forwarding them
+    // would race the CloseStream flush in the real Deepgram stream.
+    expect(stt.received).toEqual([beforeStop]);
+  });
+});
+
+describe('SessionManager timeout interplay', () => {
+  test('total timeout during a recorded session maps to llm_timeout after tokens streamed', async () => {
+    const stt = new FakeStt();
+    const { log, events } = collectEvents();
+    const hanging: LlmProvider = {
+      generate(_t, onDelta, signal) {
+        onDelta('starts fine ');
+        return new Promise((_res, reject) => {
+          signal.addEventListener('abort', () => reject(new Error('aborted')));
+        });
+      },
+    };
+    const mgr = new SessionManager({
+      createStt: async () => stt,
+      createLlm: () => hanging,
+      events,
+      timeouts: { llmFirstTokenMs: 1_000, llmTotalMs: 60 },
+    });
+
+    const id = await mgr.start();
+    await mgr.stop(id);
+
+    // The ask() path pins this already; the recorded path must share the same
+    // deadline machinery, not a copy without one.
+    expect(log.at(-1)!.sessionId).toBe(id);
+    expect((log.at(-1)!.data as AppError).code).toBe('llm_timeout');
+    expect(log.find((e) => e.type === 'done')).toBeUndefined();
+  });
+
+  test('the first-token timeout is disarmed by the first delta', async () => {
+    const stt = new FakeStt();
+    const { log, events } = collectEvents();
+    // Delta immediately, then a long quiet stretch that crosses the
+    // first-token deadline before completing.
+    const llm: LlmProvider = {
+      async generate(_t, onDelta) {
+        onDelta('first ');
+        await sleep(150);
+        return 'first token then silence';
+      },
+    };
+    const mgr = new SessionManager({
+      createStt: async () => stt,
+      createLlm: () => llm,
+      events,
+      timeouts: { llmFirstTokenMs: 50, llmTotalMs: 2_000 },
+    });
+
+    const id = await mgr.start();
+    await mgr.stop(id);
+
+    // If the timer's gotFirstToken check regressed, this answer would be
+    // killed at 50ms despite having already painted its first word.
+    expect(log.find((e) => e.type === 'error')).toBeUndefined();
+    expect(log.at(-1)).toMatchObject({ type: 'done', sessionId: id });
+  });
+
+  test('deltas emitted after the total timeout fired are suppressed', async () => {
+    const { log, events } = collectEvents();
+    const leaky: LlmProvider = {
+      generate(_t, onDelta, signal) {
+        onDelta('before');
+        return new Promise((_res, reject) => {
+          signal.addEventListener('abort', () => {
+            // A real stream can have a decoded chunk in hand when the abort
+            // lands; it must not paint into the error state.
+            onDelta(' after the deadline');
+            reject(new Error('aborted'));
+          });
+        });
+      },
+    };
+    const mgr = new SessionManager({
+      createStt: async () => new FakeStt(),
+      createLlm: () => leaky,
+      events,
+      timeouts: { llmFirstTokenMs: 1_000, llmTotalMs: 60 },
+    });
+
+    await mgr.ask('question');
+    await until(() => log.some((e) => e.type === 'error'));
+
+    expect(log.filter((e) => e.type === 'delta').map((e) => e.data)).toEqual(['before']);
+    expect((log.at(-1)!.data as AppError).code).toBe('llm_timeout');
+  });
+});
+
+describe('SessionManager LLM abort semantics', () => {
+  test("a provider throw carrying code 'aborted' stays silent even without a signal abort", async () => {
+    const { log, events } = collectEvents();
+    const failing: LlmProvider = {
+      async generate() {
+        // Providers map their own cancellation shapes to code 'aborted'
+        // (e.g. APIUserAbortError). The manager must honor the code itself,
+        // not only its own signal state, or those would toast as errors.
+        throw { code: 'aborted', message: 'Answer cancelled.' } satisfies AppError;
+      },
+    };
+    const mgr = new SessionManager({ createStt: async () => new FakeStt(), createLlm: () => failing, events });
+
+    const id = await mgr.ask('question');
+    await until(() => log.some((e) => e.type === 'partial' && e.sessionId === id));
+    await sleep(50); // let the rejection travel the pipeline
+
+    expect(log.filter((e) => e.type === 'error' || e.type === 'done')).toEqual([]);
+
+    // And the slot was still released: the next session starts clean.
+    await expect(mgr.start()).resolves.toBeGreaterThan(id);
+  });
+});
+
+describe('immutable answer context', () => {
+  test('recording captures context and provider before STT connects and reports that snapshot on completion', async () => {
+    const { legacyContext } = await import('../src/main/prompt');
+    const snapshot = legacyContext('Original resume', 'Original role', 'brief');
+    snapshot.relatedAnswer = { question: 'Original question', answer: 'Original suggestion' };
+    const gate = deferred<SttStream>();
+    const stt = new FakeStt();
+    const { events } = collectEvents();
+    let captured: unknown;
+    let doneContext: unknown;
+    let provider: unknown;
+    events.onLlmDone = (_id, _q, _a, _m, context) => { doneContext = context; };
+    const mgr = new SessionManager({ createStt: () => gate.promise,
+      createLlm: (context, selected) => { captured = context; provider = selected; return fakeLlm(); }, events });
+    const started = mgr.start(snapshot, 'groq');
+    snapshot.resume = 'Changed resume';
+    snapshot.output.answerStyle = 'detailed';
+    snapshot.relatedAnswer.answer = 'Changed suggestion';
+    gate.resolve(stt);
+    await mgr.stop(await started);
+    expect(captured).toMatchObject({ resume: 'Original resume', output: { answerStyle: 'brief' }, relatedAnswer: { answer: 'Original suggestion' } });
+    expect(provider).toBe('groq');
+    expect(doneContext).toBe(captured);
+    expect(Object.isFrozen(captured)).toBe(true);
+    expect(Object.isFrozen((captured as { output: unknown }).output)).toBe(true);
+  });
+
+  test('typed asks snapshot notes before the deferred pipeline runs', async () => {
+    const { legacyContext } = await import('../src/main/prompt');
+    const snapshot = legacyContext('', '', 'balanced');
+    snapshot.questionNote = 'Original note';
+    const { log, events } = collectEvents();
+    let captured: unknown;
+    const mgr = new SessionManager({ createStt: async () => new FakeStt(),
+      createLlm: (context) => { captured = context; return fakeLlm(); }, events });
+    await mgr.ask('Question', snapshot);
+    snapshot.questionNote = 'Edited after submission';
+    await until(() => log.some((event) => event.type === 'done'));
+    expect(captured).toMatchObject({ questionNote: 'Original note' });
+  });
+
+  test('malformed and oversized context cannot supersede a live recording', async () => {
+    const { legacyContext } = await import('../src/main/prompt');
+    const stt = new FakeStt();
+    const { events } = collectEvents();
+    const mgr = new SessionManager({ createStt: async () => stt, createLlm: () => fakeLlm(), events });
+    const id = await mgr.start();
+    const invalid = { ...legacyContext('', '', 'balanced'), questionNote: 'x'.repeat(2001) };
+    await expect(mgr.ask('Question', invalid)).rejects.toBeDefined();
+    await expect(mgr.start(invalid)).rejects.toBeDefined();
+    await expect(mgr.ask('x'.repeat(8001))).rejects.toMatchObject({ code: 'internal' });
+    const audio = new ArrayBuffer(4);
+    mgr.audio(id, audio);
+    expect(stt.received).toEqual([audio]);
+    expect(stt.aborted).toBe(false);
+  });
+
+  test('recorded transcript size is bounded before reaching the answer provider', async () => {
+    const stt = new FakeStt();
+    stt.transcript = 'x'.repeat(32001);
+    const { log, events } = collectEvents();
+    let created = false;
+    const mgr = new SessionManager({ createStt: async () => stt,
+      createLlm: () => { created = true; return fakeLlm(); }, events });
+    await mgr.stop(await mgr.start());
+    expect(created).toBe(false);
+    expect(stt.aborted).toBe(true);
+    expect(log).toContainEqual(expect.objectContaining({ type: 'error', data: expect.objectContaining({ code: 'internal' }) }));
+  });
+});
+
+describe('combined request budget', () => {
+  test('individually valid fields cannot exceed the combined request cap or supersede the active session', async () => {
+    const { legacyContext } = await import('../src/main/prompt');
+    const snapshot = legacyContext('r'.repeat(200000), 'j'.repeat(200000), 'balanced');
+    snapshot.background = 'b'.repeat(16000);
+    snapshot.instructions = 'i'.repeat(8000);
+    snapshot.questionNote = 'n'.repeat(2000);
+    snapshot.refinement = 'f'.repeat(1000);
+    snapshot.relatedAnswer = { question: 'q'.repeat(1000), answer: 'a'.repeat(3000) };
+    const stt = new FakeStt();
+    const { events } = collectEvents();
+    const mgr = new SessionManager({ createStt: async () => stt, createLlm: () => fakeLlm(), events });
+    const id = await mgr.start();
+    await expect(mgr.ask('q'.repeat(8000), snapshot)).rejects.toMatchObject({ code: 'internal' });
+    const frame = new ArrayBuffer(2);
+    mgr.audio(id, frame);
+    expect(stt.received).toEqual([frame]);
+    expect(stt.aborted).toBe(false);
+  });
+});
+
+describe('terminal resource cleanup', () => {
+  test('finalize rejection aborts the stream and emits exactly one error', async () => {
+    const stt = new FakeStt();
+    stt.finalize = async () => { throw { code: 'stt_timeout', message: 'No final transcript' }; };
+    const { log, events } = collectEvents();
+    const mgr = new SessionManager({ createStt: async () => stt, createLlm: () => fakeLlm(), events });
+    const id = await mgr.start();
+    await mgr.stop(id);
+    expect(stt.aborted).toBe(true);
+    expect(log).toEqual([{ type: 'error', sessionId: id, data: { code: 'stt_timeout', message: 'No final transcript' } }]);
+    expect(await mgr.stop(id)).toBe(false);
+  });
+
+  test('cancelling a provider that ignores abort removes timeout handles immediately', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { log, events } = collectEvents();
+      const mgr = new SessionManager({ createStt: async () => new FakeStt(),
+        createLlm: () => ({ generate: () => new Promise<string>(() => {}) }), events });
+      const id = await mgr.ask('Question');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(vi.getTimerCount()).toBe(2);
+      mgr.cancel(id);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(vi.getTimerCount()).toBe(0);
+      expect(log.filter((event) => event.type === 'error')).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('a synchronous provider failure removes timers and reports one terminal error', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { log, events } = collectEvents();
+      const mgr = new SessionManager({ createStt: async () => new FakeStt(), createLlm: () => ({
+        generate() { throw new Error('Synchronous provider failure'); },
+      }), events });
+      await mgr.ask('Question');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(vi.getTimerCount()).toBe(0);
+      expect(log.filter((event) => event.type === 'error')).toHaveLength(1);
+      expect(log.at(-1)?.data).toMatchObject({ code: 'llm_http', message: 'Synchronous provider failure' });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
